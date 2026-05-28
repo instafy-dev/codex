@@ -91,7 +91,6 @@ fn disabled_permission_user_turn(text: impl Into<String>, cwd: PathBuf, model: S
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
     Op::UserInput {
         items: vec![UserInput::Text {
-            client_id: None,
             text: text.into(),
             text_elements: Vec::new(),
         }],
@@ -405,7 +404,6 @@ async fn summarize_context_three_requests_and_instructions() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "hello world".into(),
                 text_elements: Vec::new(),
             }],
@@ -432,7 +430,6 @@ async fn summarize_context_three_requests_and_instructions() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: THIRD_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -611,7 +608,6 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "hello before blocked compact".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -686,7 +682,6 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "hello before matched compact".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -758,7 +753,6 @@ async fn manual_compact_uses_custom_prompt() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -907,7 +901,6 @@ async fn manual_compact_emits_context_compaction_items() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "manual compact".into(),
                 text_elements: Vec::new(),
             }],
@@ -1075,7 +1068,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: user_message.into(),
                 text_elements: Vec::new(),
             }],
@@ -1549,7 +1541,6 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -1567,7 +1558,6 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -1585,7 +1575,6 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -1758,7 +1747,6 @@ async fn auto_compact_emits_context_compaction_items() {
             .submit(Op::UserInput {
                 environments: None,
                 items: vec![UserInput::Text {
-                    client_id: None,
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
@@ -1841,7 +1829,6 @@ async fn auto_compact_starts_after_turn_started() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -1858,7 +1845,6 @@ async fn auto_compact_starts_after_turn_started() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -1875,7 +1861,6 @@ async fn auto_compact_starts_after_turn_started() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -2405,7 +2390,6 @@ async fn auto_compact_persists_rollout_entries() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -2422,7 +2406,6 @@ async fn auto_compact_persists_rollout_entries() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -2439,7 +2422,6 @@ async fn auto_compact_persists_rollout_entries() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -2530,7 +2512,6 @@ async fn manual_compact_retries_after_context_window_error() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "first turn".into(),
                 text_elements: Vec::new(),
             }],
@@ -2636,7 +2617,6 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "first turn".into(),
                 text_elements: Vec::new(),
             }],
@@ -2733,7 +2713,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
@@ -2753,7 +2732,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
@@ -2773,7 +2751,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: final_user_message.into(),
                 text_elements: Vec::new(),
             }],
@@ -2939,7 +2916,6 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
             .submit(Op::UserInput {
                 environments: None,
                 items: vec![UserInput::Text {
-                    client_id: None,
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
@@ -3046,7 +3022,6 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: FUNCTION_CALL_LIMIT_MSG.into(),
                 text_elements: Vec::new(),
             }],
@@ -3479,7 +3454,6 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             .submit(Op::UserInput {
                 environments: None,
                 items: vec![UserInput::Text {
-                    client_id: None,
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
@@ -3600,7 +3574,6 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
             .submit(Op::UserInput {
                 environments: None,
                 items: vec![UserInput::Text {
-                    client_id: None,
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
@@ -3664,7 +3637,6 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             .submit(Op::UserInput {
                 environments: None,
                 items: vec![UserInput::Text {
-                    client_id: None,
                     text: user.to_string(),
                     text_elements: Vec::new(),
                 }],
@@ -3693,12 +3665,10 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             environments: None,
             items: vec![
                 UserInput::Image {
-                    client_id: None,
                     image_url: image_url.clone(),
                     detail: None,
                 },
                 UserInput::Text {
-                    client_id: None,
                     text: "USER_THREE".to_string(),
                     text_elements: Vec::new(),
                 },
@@ -3890,7 +3860,6 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3907,7 +3876,6 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3982,7 +3950,6 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
         .submit(Op::UserInput {
             environments: None,
             items: vec![UserInput::Text {
-                client_id: None,
                 text: "AFTER_MANUAL_EMPTY_COMPACT".to_string(),
                 text_elements: Vec::new(),
             }],

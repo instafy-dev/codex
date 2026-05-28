@@ -210,8 +210,8 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "materialize rollout".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -279,8 +279,8 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -511,7 +511,6 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
-                    client_id: None,
                     text: preview.to_string(),
                     text_elements: text_elements.clone().into_iter().map(Into::into).collect(),
                 }]
@@ -791,8 +790,8 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -896,8 +895,8 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -995,8 +994,8 @@ async fn thread_goal_set_persists_resumable_stopped_statuses() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -1191,8 +1190,8 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "materialize this thread".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2012,7 +2011,6 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
         .send_turn_start_request(TurnStartParams {
             thread_id,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2061,8 +2059,8 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2087,8 +2085,8 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "respond with docs".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2170,8 +2168,8 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2194,8 +2192,8 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let running_turn_request_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2288,8 +2286,8 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2312,8 +2310,8 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
     let running_turn_request_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2426,8 +2424,8 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2449,8 +2447,8 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "keep running".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2536,8 +2534,8 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2620,8 +2618,8 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2643,8 +2641,8 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "run command".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2760,8 +2758,8 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let seed_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2784,8 +2782,8 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let running_turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "apply patch".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -2929,8 +2927,8 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: resumed_thread.id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3242,8 +3240,8 @@ async fn start_materialized_thread_and_restart(
     let materialize_turn_id = first_mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: seed_text.to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3332,8 +3330,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let materialize_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "seed history".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3373,8 +3371,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let turn_id = secondary
         .send_turn_start_request(TurnStartParams {
             thread_id: resume.thread.id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],

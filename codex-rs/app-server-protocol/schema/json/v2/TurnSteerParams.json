@@ -76,13 +76,6 @@
       "oneOf": [
         {
           "properties": {
-            "clientId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "text": {
               "type": "string"
             },
@@ -111,13 +104,6 @@
         },
         {
           "properties": {
-            "clientId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "detail": {
               "anyOf": [
                 {
@@ -149,13 +135,6 @@
         },
         {
           "properties": {
-            "clientId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "detail": {
               "anyOf": [
                 {
@@ -187,13 +166,6 @@
         },
         {
           "properties": {
-            "clientId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "name": {
               "type": "string"
             },
@@ -218,13 +190,6 @@
         },
         {
           "properties": {
-            "clientId": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "name": {
               "type": "string"
             },
@@ -251,6 +216,12 @@
     }
   },
   "properties": {
+    "clientUserMessageId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "expectedTurnId": {
       "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
       "type": "string"

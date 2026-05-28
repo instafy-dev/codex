@@ -2628,7 +2628,6 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
-            client_id: None,
             image_url: image_url.clone(),
             detail: None,
         }]);
@@ -2660,7 +2659,6 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
-            client_id: None,
             image_url: image_url.clone(),
             detail: Some(ImageDetail::Original),
         }]);
@@ -2853,12 +2851,10 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![
             UserInput::Image {
-                client_id: None,
                 image_url: image_url.clone(),
                 detail: None,
             },
             UserInput::LocalImage {
-                client_id: None,
                 path: local_path,
                 detail: None,
             },
@@ -2915,7 +2911,6 @@ mod tests {
         std::fs::write(&local_path, TINY_PNG_BYTES)?;
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
-            client_id: None,
             path: local_path,
             detail: Some(ImageDetail::Original),
         }]);
@@ -2942,7 +2937,6 @@ mod tests {
         let missing_path = dir.path().join("missing-image.png");
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
-            client_id: None,
             path: missing_path.clone(),
             detail: None,
         }]);
@@ -2978,7 +2972,6 @@ mod tests {
         std::fs::write(&json_path, br#"{"hello":"world"}"#)?;
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
-            client_id: None,
             path: json_path.clone(),
             detail: None,
         }]);
@@ -3017,7 +3010,6 @@ mod tests {
         )?;
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
-            client_id: None,
             path: svg_path.clone(),
             detail: None,
         }]);

@@ -414,7 +414,7 @@ async fn run_hooks_and_record_inputs(
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item, TurnInput::UserInput(items) if !items.is_empty()) {
+            if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
                 accepted_user_input = true;
             }
             record_pending_input(
@@ -442,7 +442,7 @@ async fn build_skills_and_plugins(
     let user_input = input
         .iter()
         .filter_map(|item| match item {
-            TurnInput::UserInput(content) => Some(content.as_slice()),
+            TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseInputItem(_) => None,
         })
         .flatten()
@@ -595,7 +595,7 @@ async fn track_turn_resolved_config_analytics(
             num_input_images: input
                 .iter()
                 .filter_map(|item| match item {
-                    TurnInput::UserInput(content) => Some(content.as_slice()),
+                    TurnInput::UserInput { content, .. } => Some(content.as_slice()),
                     TurnInput::ResponseInputItem(_) => None,
                 })
                 .flatten()

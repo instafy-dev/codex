@@ -1359,7 +1359,6 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         .spawn_agent_with_metadata(
             (*turn.config).clone(),
             vec![UserInput::Text {
-                client_id: None,
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
             }]
@@ -1436,7 +1435,6 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         .spawn_agent_with_metadata(
             (*turn.config).clone(),
             vec![UserInput::Text {
-                client_id: None,
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
             }]
@@ -1610,7 +1608,6 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
         .spawn_agent_with_metadata(
             config.clone(),
             vec![UserInput::Text {
-                client_id: None,
                 text: "research".to_string(),
                 text_elements: Vec::new(),
             }]
@@ -1632,7 +1629,6 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
         .spawn_agent_with_metadata(
             config,
             vec![UserInput::Text {
-                client_id: None,
                 text: "build".to_string(),
                 text_elements: Vec::new(),
             }]
@@ -2586,12 +2582,10 @@ async fn send_input_accepts_structured_items() {
         environments: None,
         items: vec![
             UserInput::Mention {
-                client_id: None,
                 name: "drive".to_string(),
                 path: "app://google_drive".to_string(),
             },
             UserInput::Text {
-                client_id: None,
                 text: "read the folder".to_string(),
                 text_elements: Vec::new(),
             },

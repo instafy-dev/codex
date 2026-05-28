@@ -155,7 +155,6 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
-                    client_id: None,
                     text: preview.to_string(),
                     text_elements: Vec::new(),
                 }]
@@ -647,7 +646,6 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
-                    client_id: None,
                     text: preview.to_string(),
                     text_elements: Vec::new(),
                 }]
@@ -742,8 +740,8 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: fork_thread_id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
-                client_id: None,
                 text: "continue".to_string(),
                 text_elements: Vec::new(),
             }],
