@@ -2260,7 +2260,7 @@ async fn model_selection_popup_snapshot() {
 
 #[tokio::test]
 async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.thread_id = Some(ThreadId::new());
     chat.open_personality_popup();
 
@@ -2271,7 +2271,7 @@ async fn personality_selection_popup_snapshot() {
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn realtime_audio_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.open_realtime_audio_popup();
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -2281,7 +2281,7 @@ async fn realtime_audio_selection_popup_snapshot() {
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn realtime_audio_selection_popup_narrow_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.open_realtime_audio_popup();
 
     let popup = render_bottom_popup(&chat, /*width*/ 56);
@@ -2291,7 +2291,7 @@ async fn realtime_audio_selection_popup_narrow_snapshot() {
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn realtime_microphone_picker_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.config.realtime_audio.microphone = Some("Studio Mic".to_string());
     chat.open_realtime_audio_device_selection_with_names(
         RealtimeAudioDeviceKind::Microphone,
@@ -2305,7 +2305,7 @@ async fn realtime_microphone_picker_popup_snapshot() {
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn realtime_audio_picker_emits_persist_event() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.open_realtime_audio_device_selection_with_names(
         RealtimeAudioDeviceKind::Speaker,
         vec!["Desk Speakers".to_string(), "Headphones".to_string()],
@@ -2368,8 +2368,8 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
 
 #[tokio::test]
 async fn server_overloaded_error_does_not_switch_models() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
-    chat.set_model("gpt-5.3-codex");
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.set_model("gpt-5.4");
     while rx.try_recv().is_ok() {}
     while op_rx.try_recv().is_ok() {}
 
@@ -2382,7 +2382,7 @@ async fn server_overloaded_error_does_not_switch_models() {
     while let Ok(event) = rx.try_recv() {
         if let AppEvent::UpdateModel(model) = event {
             assert_eq!(
-                model, "gpt-5.3-codex",
+                model, "gpt-5.4",
                 "did not expect model switch on server-overloaded error"
             );
         }

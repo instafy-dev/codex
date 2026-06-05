@@ -1117,7 +1117,7 @@ async fn slash_rename_without_existing_thread_name_starts_empty() {
 
 #[tokio::test]
 async fn usage_error_slash_command_is_available_from_local_recall() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
 
     submit_composer_text(&mut chat, "/raw maybe");
 
@@ -2226,7 +2226,7 @@ async fn user_turn_carries_service_tier_after_fast_toggle() {
 
 #[tokio::test]
 async fn model_switch_recomputes_catalog_default_service_tier() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
@@ -2249,7 +2249,7 @@ async fn model_switch_recomputes_catalog_default_service_tier() {
         Some(ServiceTier::Fast.request_value())
     );
 
-    chat.set_model("gpt-5.3-codex");
+    chat.set_model("gpt-5.4");
     assert_eq!(chat.current_service_tier(), None);
 
     chat.bottom_pane

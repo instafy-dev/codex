@@ -30,7 +30,7 @@ Upgrade with the narrowest safe change set:
    - Prefer the closest prompt surface first: inline system or developer text, then adjacent prompt files, then shared templates.
    - If you cannot confidently tie a prompt to the model usage, say so instead of guessing.
 3. Classify the source model family.
-   - Common buckets: GPT-5.4, GPT-5.3-Codex or GPT-5.2-Codex, earlier GPT-5.x, GPT-4o or GPT-4.1, reasoning models such as o1 or o3 or o4-mini, third-party model, or mixed and unclear.
+   - Common buckets: GPT-5.4, GPT-5.2-Codex, earlier GPT-5.x, GPT-4o or GPT-4.1, reasoning models such as o1 or o3 or o4-mini, third-party model, or mixed and unclear.
 4. Decide the upgrade class.
    - `model string only`
    - `model string + light prompt rewrite`

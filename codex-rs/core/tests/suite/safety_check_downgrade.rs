@@ -28,7 +28,7 @@ use pretty_assertions::assert_eq;
 use wiremock::ResponseTemplate;
 
 const SERVER_MODEL: &str = "gpt-5.2";
-const REQUESTED_MODEL: &str = "gpt-5.3-codex";
+const REQUESTED_MODEL: &str = "gpt-5.4";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
 const CYBER_POLICY_MESSAGE: &str =

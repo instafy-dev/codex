@@ -59,24 +59,24 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
 
     let server = MockServer::start().await;
     let generic = test_remote_model_with_policy(
-        "gpt-5.3",
+        "gpt-5.4",
         ModelVisibility::List,
         /*priority*/ 1_000,
         TruncationPolicyConfig::bytes(/*limit*/ 10_000),
     );
     let specific = test_remote_model_with_policy(
-        "gpt-5.3-codex",
+        "gpt-5.4-special",
         ModelVisibility::List,
         /*priority*/ 1_000,
         TruncationPolicyConfig::bytes(/*limit*/ 10_000),
     );
     let specific = ModelInfo {
-        display_name: "GPT 5.3 Codex".to_string(),
+        display_name: "GPT 5.4 Special".to_string(),
         base_instructions: "use specific prefix".to_string(),
         ..specific
     };
     let generic = ModelInfo {
-        display_name: "GPT 5.3".to_string(),
+        display_name: "GPT 5.4".to_string(),
         base_instructions: "use generic prefix".to_string(),
         ..generic
     };
@@ -105,10 +105,10 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
     manager.list_models(RefreshStrategy::OnlineIfUncached).await;
 
     let model_info = manager
-        .get_model_info("gpt-5.3-codex-test", &config.to_models_manager_config())
+        .get_model_info("gpt-5.4-special-test", &config.to_models_manager_config())
         .await;
 
-    assert_eq!(model_info.slug, "gpt-5.3-codex-test");
+    assert_eq!(model_info.slug, "gpt-5.4-special-test");
     assert_eq!(model_info.base_instructions, specific.base_instructions);
 
     Ok(())
@@ -323,8 +323,8 @@ async fn remote_models_long_model_slug_is_sent_with_custom_reasoning() -> Result
     skip_if_sandbox!(Ok(()));
 
     let server = MockServer::start().await;
-    let requested_model = "gpt-5.3-codex-test";
-    let prefix_model = "gpt-5.3-codex";
+    let requested_model = "gpt-5.4-test";
+    let prefix_model = "gpt-5.4";
     let mut remote_model = test_remote_model_with_policy(
         prefix_model,
         ModelVisibility::List,

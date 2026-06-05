@@ -510,7 +510,7 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
         event,
         &thread.id,
         &thread.session_id,
-        "gpt-5.3-codex",
+        "gpt-5.4",
         "resumed",
         "user",
     );
@@ -1787,7 +1787,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         &config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 
@@ -3522,7 +3522,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
 
     let start_id = primary
         .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.3-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
         .await?;
@@ -3561,7 +3561,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,
-            model: Some("gpt-5.3-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             personality: Some(Personality::Friendly),
             ..Default::default()
         })
@@ -3624,7 +3624,7 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 
@@ -3654,7 +3654,7 @@ fn create_config_toml_with_chatgpt_base_url(
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 chatgpt_base_url = "{chatgpt_base_url}"
@@ -3684,7 +3684,7 @@ fn create_config_toml_with_required_broken_mcp(
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 

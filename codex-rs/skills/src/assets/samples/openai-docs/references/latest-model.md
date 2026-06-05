@@ -14,7 +14,7 @@ This file is a curated helper. Every recommendation here must be verified agains
 | `gpt-5.5` | Explicit no-reasoning text path via `reasoning.effort: none` |
 | `gpt-4.1-mini` | Cheaper no-reasoning text |
 | `gpt-4.1-nano` | Fastest and cheapest no-reasoning text |
-| `gpt-5.3-codex` | Agentic coding, code editing, and tool-heavy coding workflows |
+| `gpt-5.4` | Agentic coding, code editing, and tool-heavy coding workflows |
 | `gpt-5.1-codex-mini` | Cheaper coding workflows |
 | `gpt-image-2` | Best image generation and edit quality |
 | `gpt-image-1.5` | Less expensive image generation and edit quality |

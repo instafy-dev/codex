@@ -27,7 +27,7 @@ use wiremock::ResponseTemplate;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUESTED_MODEL: &str = "gpt-5.4";
-const SERVER_MODEL: &str = "gpt-5.3-codex";
+const SERVER_MODEL: &str = "gpt-5.4";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 const CYBER_POLICY_MESSAGE: &str =
     "This request has been flagged for potentially high-risk cyber activity.";

@@ -2432,7 +2432,7 @@ async fn code_mode_can_use_view_image_result_with_image_helper() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
+        .with_model("gpt-5.4")
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
         });
@@ -2526,7 +2526,7 @@ image(imageItem);
         &server,
         "use exec to call the rmcp image scenario tool and emit its image output",
         code,
-        "gpt-5.3-codex",
+        "gpt-5.4",
     )
     .await?;
 

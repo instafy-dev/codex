@@ -1182,7 +1182,7 @@ async fn get_base_instructions_no_user_content() {
             expects_apply_patch_description: false,
         },
         InstructionsTestCase {
-            slug: "gpt-5.3-codex",
+            slug: "gpt-5.4",
             expects_apply_patch_description: false,
         },
         InstructionsTestCase {
