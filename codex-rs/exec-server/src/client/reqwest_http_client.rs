@@ -6,6 +6,7 @@
 //!   orchestrator has forwarded `http/request` over JSON-RPC
 
 use std::error::Error as StdError;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -47,16 +48,25 @@ pub(crate) struct PendingReqwestHttpBodyStream {
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct ReqwestHttpRequestRunner {
     client: reqwest::Client,
+    loopback_client: reqwest::Client,
 }
 
 impl ReqwestHttpClient {
-    fn build_client(timeout_ms: Option<u64>) -> Result<reqwest::Client, ExecServerError> {
-        let builder = match timeout_ms {
+    fn build_client(
+        timeout_ms: Option<u64>,
+        disable_proxy: bool,
+    ) -> Result<reqwest::Client, ExecServerError> {
+        let mut builder = match timeout_ms {
             None => reqwest::Client::builder(),
             Some(timeout_ms) => {
                 reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms))
             }
         };
+        if disable_proxy {
+            // Loopback MCP capabilities can carry bearer credentials. Never let an ambient
+            // HTTP(S)_PROXY observe those headers before the destination Host policy runs.
+            builder = builder.no_proxy();
+        }
         build_reqwest_client_with_custom_ca(builder)
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
     }
@@ -112,9 +122,14 @@ impl HttpClient for ReqwestHttpClient {
 
 impl ReqwestHttpRequestRunner {
     pub(crate) fn new(timeout_ms: Option<u64>) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::build_client(timeout_ms)
+        let client = ReqwestHttpClient::build_client(timeout_ms, false)
             .map_err(|error| internal_error(error.to_string()))?;
-        Ok(Self { client })
+        let loopback_client = ReqwestHttpClient::build_client(timeout_ms, true)
+            .map_err(|error| internal_error(error.to_string()))?;
+        Ok(Self {
+            client,
+            loopback_client,
+        })
     }
 
     pub(crate) async fn run(
@@ -136,7 +151,12 @@ impl ReqwestHttpRequestRunner {
         }
 
         let headers = Self::build_headers(params.headers)?;
-        let mut request = self.client.request(method.clone(), url).headers(headers);
+        let client = if url_is_loopback(&url) {
+            &self.loopback_client
+        } else {
+            &self.client
+        };
+        let mut request = client.request(method.clone(), url).headers(headers);
         if let Some(body) = params.body {
             request = request.body(body.into_inner());
         }
@@ -273,6 +293,16 @@ impl ReqwestHttpRequestRunner {
     }
 }
 
+fn url_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn log_send_error(method: &Method, error: reqwest::Error) {
     let error = error.without_url();
     let source_chain = error_source_chain(&error);
@@ -294,4 +324,84 @@ fn error_source_chain(error: &reqwest::Error) -> Option<String> {
         source = error.source();
     }
     (!sources.is_empty()).then(|| sources.join(": "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::any;
+    use wiremock::matchers::header;
+
+    #[test]
+    fn loopback_urls_are_selected_for_direct_proxy_bypass() {
+        for value in [
+            "http://127.0.0.1:4321/mcp",
+            "http://127.9.8.7/mcp",
+            "http://[::1]:4321/mcp",
+            "https://localhost/mcp",
+        ] {
+            assert!(url_is_loopback(&Url::parse(value).expect("valid test URL")));
+        }
+        for value in ["https://example.com/mcp", "http://192.168.1.5/mcp"] {
+            assert!(!url_is_loopback(
+                &Url::parse(value).expect("valid test URL")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_request_and_bearer_never_reach_a_configured_poison_proxy() {
+        let target = MockServer::start().await;
+        let poison_proxy = MockServer::start().await;
+        Mock::given(any())
+            .and(header("authorization", "Bearer personal-browser-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("target"))
+            .expect(1)
+            .mount(&target)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(502).set_body_string("proxy observed request"))
+            .mount(&poison_proxy)
+            .await;
+
+        let proxied_builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid poison proxy URL"));
+        let direct_builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid poison proxy URL"))
+            .no_proxy();
+        let runner = ReqwestHttpRequestRunner {
+            client: build_reqwest_client_with_custom_ca(proxied_builder).expect("proxied client"),
+            loopback_client: build_reqwest_client_with_custom_ca(direct_builder)
+                .expect("direct loopback client"),
+        };
+
+        let (response, pending) = runner
+            .run(HttpRequestParams {
+                method: "GET".to_string(),
+                url: format!("{}/mcp", target.uri()),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer personal-browser-secret".to_string(),
+                }],
+                body: None,
+                timeout_ms: Some(2_000),
+                request_id: "loopback-no-proxy".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect("loopback request succeeds directly");
+
+        assert_eq!(response.status, 200);
+        assert!(pending.is_none());
+        assert!(
+            poison_proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
 }
