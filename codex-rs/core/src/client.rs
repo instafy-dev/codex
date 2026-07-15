@@ -1668,7 +1668,7 @@ impl ModelClientSession {
                     }
                 }
 
-                self.stream_responses_api(
+                Box::pin(self.stream_responses_api(
                     prompt,
                     model_info,
                     session_telemetry,
@@ -1677,7 +1677,7 @@ impl ModelClientSession {
                     service_tier,
                     responses_metadata,
                     inference_trace,
-                )
+                ))
                 .await
             }
         }
