@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct SessionServices {
     /// The latest manager; callers retain an owned handle while performing MCP I/O.
     pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
+    /// Serializes manager construction/replacement with session shutdown. Managers are
+    /// registered here before their confirmed shutdown is awaited so cancellation of a
+    /// refresh cannot make an older stdio process unreachable to final teardown.
+    pub(crate) mcp_connection_manager_lifecycle: Mutex<McpConnectionManagerLifecycle>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -88,6 +92,17 @@ pub(crate) struct SessionServices {
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
 }
 
+#[derive(Default)]
+pub(crate) struct McpConnectionManagerLifecycle {
+    pub(crate) retired: Vec<Arc<McpConnectionManager>>,
+    /// Set before refresh construction starts and cleared only after the replacement is
+    /// registered and every preceding manager has completed confirmed shutdown.
+    pub(crate) refresh_in_progress: bool,
+    /// Sticky evidence that an earlier refresh was abandoned while a newly launched stdio
+    /// process may still have been unregistered. Later successful refreshes must not erase it.
+    pub(crate) refresh_tainted: bool,
+}
+
 impl SessionServices {
     /// Installs the manager before validating required servers so startup-time elicitation can
     /// resolve through the session's manager while validation waits.
@@ -95,10 +110,63 @@ impl SessionServices {
         &self,
         manager: McpConnectionManager,
     ) -> Result<()> {
-        self.mcp_connection_manager.store(Arc::new(manager));
+        let mut lifecycle = self.mcp_connection_manager_lifecycle.lock().await;
+        let previous = self.mcp_connection_manager.swap(Arc::new(manager));
+        lifecycle.retired.push(Arc::clone(&previous));
+        previous.shutdown_confirmed().await?;
+        lifecycle
+            .retired
+            .retain(|retired| !Arc::ptr_eq(retired, &previous));
         self.mcp_connection_manager
             .load_full()
             .validate_required_servers()
             .await
+    }
+
+    /// Confirms shutdown for the active manager and every older manager whose prior
+    /// refresh teardown did not complete. This is the authority-handoff barrier used by
+    /// session shutdown.
+    pub(crate) async fn shutdown_mcp_connection_managers_confirmed(&self) -> Result<()> {
+        let mut lifecycle = self.mcp_connection_manager_lifecycle.lock().await;
+        let current = self.mcp_connection_manager.load_full();
+        let mut failures = Vec::new();
+
+        if lifecycle.refresh_in_progress {
+            failures.push(
+                "an MCP refresh remains in progress or was interrupted before its full process lifecycle was confirmed"
+                    .to_string(),
+            );
+        }
+        if lifecycle.refresh_tainted {
+            failures.push(
+                "an earlier MCP refresh left an unregistered process lifecycle unconfirmed"
+                    .to_string(),
+            );
+        }
+
+        if let Err(error) = current.shutdown_confirmed().await {
+            failures.push(format!("active manager: {error:#}"));
+        }
+
+        let mut still_unconfirmed = Vec::new();
+        for retired in lifecycle.retired.drain(..) {
+            match retired.shutdown_confirmed().await {
+                Ok(()) => {}
+                Err(error) => {
+                    failures.push(format!("retired manager: {error:#}"));
+                    still_unconfirmed.push(retired);
+                }
+            }
+        }
+        lifecycle.retired = still_unconfirmed;
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "MCP manager shutdown could not be confirmed: {}",
+                failures.join("; ")
+            ))
+        }
     }
 }

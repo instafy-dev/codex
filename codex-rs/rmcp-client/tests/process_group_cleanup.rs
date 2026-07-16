@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -172,9 +173,48 @@ async fn shutdown_kills_initialized_stdio_server_with_in_flight_operation() -> R
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    client.shutdown().await;
+    client.shutdown_confirmed().await?;
 
-    wait_for_process_exit(server_pid).await?;
+    assert!(
+        !process_exists(server_pid),
+        "confirmed shutdown returned before the MCP server exited"
+    );
     let _ = tokio::time::timeout(Duration::from_secs(5), call_task).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_shutdown_escalates_and_waits_for_term_resistant_process_group() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let server_pid_file = temp_dir.path().join("server.pid");
+    let child_pid_file = temp_dir.path().join("child.pid");
+    let command = format!(
+        "trap '' TERM; echo $$ > '{}'; sleep 300 & child_pid=$!; echo \"$child_pid\" > '{}'; cat >/dev/null",
+        server_pid_file.display(),
+        child_pid_file.display(),
+    );
+    let client = RmcpClient::new_stdio_client(
+        OsString::from("/bin/sh"),
+        vec![OsString::from("-c"), OsString::from(command)],
+        None,
+        &[],
+        /*cwd*/ None,
+        Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
+    )
+    .await?;
+    let server_pid = wait_for_pid_file(&server_pid_file).await?;
+    let child_pid = wait_for_pid_file(&child_pid_file).await?;
+    assert!(process_exists(server_pid));
+    assert!(process_exists(child_pid));
+
+    let started = Instant::now();
+    client.shutdown_confirmed().await?;
+
+    assert!(
+        started.elapsed() <= Duration::from_secs(4),
+        "confirmed shutdown exceeded its TERM/KILL budget"
+    );
+    assert!(!process_exists(server_pid));
+    assert!(!process_exists(child_pid));
     Ok(())
 }

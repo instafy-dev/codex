@@ -359,9 +359,29 @@ impl McpConnectionManager {
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_confirmed().await {
+            warn!("MCP shutdown was not fully confirmed: {error:#}");
+        }
+    }
+
+    /// Stop all clients and fail if any local/remote MCP process cannot be
+    /// confirmed terminated. Authority-sensitive callers use this before
+    /// handing control back to another actor.
+    pub async fn shutdown_confirmed(&self) -> Result<()> {
         self.startup_cancellation_token.cancel();
-        for client in self.clients.values() {
-            client.shutdown().await;
+        let mut failures = Vec::new();
+        for (server_name, client) in &self.clients {
+            if let Err(error) = client.shutdown_confirmed().await {
+                failures.push(format!("{server_name}: {error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "one or more MCP servers failed confirmed shutdown: {}",
+                failures.join("; ")
+            ))
         }
     }
 

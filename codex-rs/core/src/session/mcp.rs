@@ -310,7 +310,19 @@ impl Session {
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+    ) -> anyhow::Result<()> {
+        // Serialize the complete refresh with final session shutdown. The unconfirmed latch is
+        // set before construction can launch a new stdio process, and the previous manager is
+        // registered as retired before its confirmed shutdown is awaited. Cancellation at any
+        // await point therefore makes ShutdownComplete fail closed.
+        let mut lifecycle = self.services.mcp_connection_manager_lifecycle.lock().await;
+        if lifecycle.refresh_in_progress {
+            // Reacquiring the mutex with this flag set means an earlier refresh future was
+            // dropped. Its partly constructed manager may have launched a process before a
+            // handle was registered, so this uncertainty is permanent for the session.
+            lifecycle.refresh_tainted = true;
+        }
+        lifecycle.refresh_in_progress = true;
         let auth = self.services.auth_manager.auth().await;
         let config = self.get_config().await;
         let mcp_config = self.runtime_mcp_config(config.as_ref()).await;
@@ -370,23 +382,37 @@ impl Session {
             elicitation_reviewer,
         )
         .await;
-        {
-            let current_manager = self.services.mcp_connection_manager.load_full();
-            refreshed_manager.set_elicitations_auto_deny(current_manager.elicitations_auto_deny());
-        }
-        self.services
+        let current_manager = self.services.mcp_connection_manager.load_full();
+        refreshed_manager.set_elicitations_auto_deny(current_manager.elicitations_auto_deny());
+        let previous_manager = self
+            .services
             .mcp_connection_manager
-            .store(Arc::new(refreshed_manager));
+            .swap(Arc::new(refreshed_manager));
+        lifecycle.retired.push(Arc::clone(&previous_manager));
+
+        previous_manager
+            .shutdown_confirmed()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "previous MCP manager shutdown could not be confirmed during refresh: {error:#}"
+                )
+            })?;
+        lifecycle
+            .retired
+            .retain(|retired| !Arc::ptr_eq(retired, &previous_manager));
+        lifecycle.refresh_in_progress = false;
+        Ok(())
     }
 
     pub(crate) async fn refresh_mcp_servers_if_requested(
         &self,
         turn_context: &TurnContext,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+    ) -> anyhow::Result<()> {
         let refresh_config = { self.pending_mcp_server_refresh_config.lock().await.take() };
         let Some(refresh_config) = refresh_config else {
-            return;
+            return Ok(());
         };
 
         let McpServerRefreshConfig {
@@ -399,8 +425,9 @@ impl Session {
             match serde_json::from_value::<HashMap<String, McpServerConfig>>(mcp_servers) {
                 Ok(servers) => servers,
                 Err(err) => {
-                    warn!("failed to parse MCP server refresh config: {err}");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "failed to parse MCP server refresh config: {err}"
+                    ));
                 }
             };
         let store_mode = match serde_json::from_value::<OAuthCredentialsStoreMode>(
@@ -408,16 +435,18 @@ impl Session {
         ) {
             Ok(mode) => mode,
             Err(err) => {
-                warn!("failed to parse MCP OAuth refresh config: {err}");
-                return;
+                return Err(anyhow::anyhow!(
+                    "failed to parse MCP OAuth refresh config: {err}"
+                ));
             }
         };
         let keyring_backend_kind =
             match serde_json::from_value::<AuthKeyringBackendKind>(auth_keyring_backend_kind) {
                 Ok(kind) => kind,
                 Err(err) => {
-                    warn!("failed to parse MCP auth keyring backend refresh config: {err}");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "failed to parse MCP auth keyring backend refresh config: {err}"
+                    ));
                 }
             };
 
@@ -428,7 +457,7 @@ impl Session {
             keyring_backend_kind,
             elicitation_reviewer,
         )
-        .await;
+        .await
     }
 
     pub(crate) async fn set_openai_form_elicitation_support(
@@ -466,7 +495,7 @@ impl Session {
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+    ) -> anyhow::Result<()> {
         self.refresh_mcp_servers_inner(
             turn_context,
             mcp_servers,
@@ -474,7 +503,7 @@ impl Session {
             keyring_backend_kind,
             elicitation_reviewer,
         )
-        .await;
+        .await
     }
 
     #[cfg(test)]

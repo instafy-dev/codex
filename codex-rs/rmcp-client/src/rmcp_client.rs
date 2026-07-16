@@ -728,18 +728,29 @@ impl RmcpClient {
 
     /// Stop the MCP transport and any stdio server process owned by this client.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_confirmed().await {
+            warn!("failed to terminate MCP stdio server process: {error}");
+        }
+    }
+
+    /// Stop the MCP transport and return only after its stdio process group is
+    /// confirmed gone. Callers that gate an external authority handoff on MCP
+    /// teardown must use this stricter variant.
+    pub async fn shutdown_confirmed(&self) -> io::Result<()> {
         let previous_state = {
             let mut guard = self.state.lock().await;
             std::mem::replace(&mut *guard, ClientState::Closed)
         };
 
-        if let Some(process) = &self.stdio_process
-            && let Err(error) = process.terminate().await
-        {
-            warn!("failed to terminate MCP stdio server process: {error}");
-        }
-
+        // Dropping/cancelling the running service first closes the transport
+        // and lets the direct child be reaped while the process handle then
+        // waits for the entire stdio server process group to disappear.
         drop(previous_state);
+
+        if let Some(process) = &self.stdio_process {
+            process.terminate().await?;
+        }
+        Ok(())
     }
 
     /// This should be called after every tool call so that if a given tool call triggered

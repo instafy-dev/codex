@@ -66,7 +66,6 @@ use rmcp::model::JsonObject;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::Tool as RmcpTool;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 /// MCP server capability indicating that Codex should include [`SandboxState`]
 /// in tool-call request `_meta` under this key.
@@ -244,14 +243,20 @@ impl AsyncManagedClient {
         self.client.clone().await
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown_confirmed(&self) -> Result<()> {
         self.cancel_token.cancel();
         match self.client().await {
-            Ok(client) => client.client.shutdown().await,
-            Err(StartupOutcomeError::Cancelled) => {}
-            Err(error) => {
-                warn!("failed to initialize MCP client during shutdown: {error:#}");
-            }
+            Ok(client) => client
+                .client
+                .shutdown_confirmed()
+                .await
+                .map_err(anyhow::Error::from),
+            Err(StartupOutcomeError::Cancelled) => Err(anyhow!(
+                "MCP startup was cancelled before process shutdown could be confirmed"
+            )),
+            Err(error) => Err(anyhow!(
+                "failed to initialize MCP client during confirmed shutdown: {error:#}"
+            )),
         }
     }
 

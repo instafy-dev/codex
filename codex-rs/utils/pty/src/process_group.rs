@@ -149,6 +149,33 @@ pub fn terminate_process_group(_process_group_id: u32) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
+/// Return whether a specific process group still has at least one member.
+pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
+    use std::io::ErrorKind;
+
+    let result = unsafe { libc::killpg(process_group_id as libc::pid_t, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    // EPERM still proves that the group exists even though it cannot be
+    // signalled by this process.
+    if error.kind() == ErrorKind::PermissionDenied || error.raw_os_error() == Some(libc::EPERM) {
+        return Ok(true);
+    }
+    Err(error)
+}
+
+#[cfg(not(unix))]
+/// Non-Unix platforms do not expose POSIX process groups.
+pub fn process_group_exists(_process_group_id: u32) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
 /// Send SIGINT to a specific process group ID (best-effort).
 pub fn interrupt_process_group(process_group_id: u32) -> io::Result<()> {
     signal_process_group_id(process_group_id as libc::pid_t, libc::SIGINT).map(|_| ())
