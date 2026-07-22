@@ -67,9 +67,12 @@ impl ReqwestHttpClient {
                 reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms))
             }
         };
-        let builder = match redirect_policy {
-            HttpRedirectPolicy::Follow => builder,
-            HttpRedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
+        let builder = match (redirect_policy, disable_proxy) {
+            (HttpRedirectPolicy::Follow, true) => {
+                builder.redirect(loopback_same_origin_redirect_policy())
+            }
+            (HttpRedirectPolicy::Follow, false) => builder,
+            (HttpRedirectPolicy::Stop, _) => builder.redirect(reqwest::redirect::Policy::none()),
         };
         let mut builder = with_chatgpt_cloudflare_cookie_store(builder);
         if disable_proxy {
@@ -334,6 +337,28 @@ fn url_is_loopback(url: &Url) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn loopback_same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // Match reqwest's default policy: the first entry is the original request,
+        // so a chain may follow ten redirects and rejects the eleventh.
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        let Some(original_url) = attempt.previous().first() else {
+            return attempt.error("redirect is missing its original URL");
+        };
+        if urls_have_same_origin(original_url, attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("loopback http/request redirect changed origin")
+        }
+    })
+}
+
+fn urls_have_same_origin(original: &Url, candidate: &Url) -> bool {
+    original.origin() == candidate.origin()
+}
+
 fn log_send_error(method: &Method, error: reqwest::Error) {
     let error = error.without_url();
     let source_chain = error_source_chain(&error);
@@ -365,6 +390,7 @@ mod tests {
     use wiremock::ResponseTemplate;
     use wiremock::matchers::any;
     use wiremock::matchers::header;
+    use wiremock::matchers::path;
 
     #[test]
     fn loopback_urls_are_selected_for_direct_proxy_bypass() {
@@ -385,6 +411,33 @@ mod tests {
                 &Url::parse(value).expect("valid test URL")
             ));
         }
+    }
+
+    #[test]
+    fn redirect_origin_comparison_uses_scheme_host_and_effective_port() {
+        let http = Url::parse("http://localhost/mcp").expect("valid URL");
+        let https = Url::parse("https://localhost/mcp").expect("valid URL");
+
+        assert!(urls_have_same_origin(
+            &http,
+            &Url::parse("http://LOCALHOST:80/elsewhere").expect("valid URL")
+        ));
+        assert!(urls_have_same_origin(
+            &https,
+            &Url::parse("https://localhost:443/elsewhere").expect("valid URL")
+        ));
+        assert!(!urls_have_same_origin(
+            &http,
+            &Url::parse("https://localhost/mcp").expect("valid URL")
+        ));
+        assert!(!urls_have_same_origin(
+            &http,
+            &Url::parse("http://127.0.0.1/mcp").expect("valid URL")
+        ));
+        assert!(!urls_have_same_origin(
+            &http,
+            &Url::parse("http://localhost:4321/mcp").expect("valid URL")
+        ));
     }
 
     #[tokio::test]
@@ -436,6 +489,153 @@ mod tests {
             .expect("loopback request succeeds directly");
 
         assert_eq!(response.status, 200);
+        assert!(pending.is_none());
+        assert!(
+            poison_proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_cross_origin_redirect_reaches_neither_target_nor_poison_proxy() {
+        let redirect_source = MockServer::start().await;
+        let redirect_target = MockServer::start().await;
+        let poison_proxy = MockServer::start().await;
+        Mock::given(path("/start"))
+            .and(header("authorization", "Bearer personal-browser-secret"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/must-not-be-reached", redirect_target.uri()),
+            ))
+            .expect(1)
+            .mount(&redirect_source)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("redirect target"))
+            .expect(0)
+            .mount(&redirect_target)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(502).set_body_string("proxy observed request"))
+            .expect(0)
+            .mount(&poison_proxy)
+            .await;
+
+        let runner = ReqwestHttpRequestRunner {
+            client: build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+                reqwest::Client::builder()
+                    .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid proxy URL")),
+            ))
+            .expect("proxied client"),
+            loopback_client: build_reqwest_client_with_custom_ca(
+                with_chatgpt_cloudflare_cookie_store(
+                    reqwest::Client::builder()
+                        .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid proxy URL"))
+                        .no_proxy()
+                        .redirect(loopback_same_origin_redirect_policy()),
+                ),
+            )
+            .expect("direct loopback client"),
+        };
+
+        let error = match runner
+            .run(HttpRequestParams {
+                method: "GET".to_string(),
+                url: format!("{}/start", redirect_source.uri()),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer personal-browser-secret".to_string(),
+                }],
+                body: None,
+                timeout_ms: Some(2_000),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "loopback-cross-origin-redirect".to_string(),
+                stream_response: false,
+            })
+            .await
+        {
+            Ok(_) => panic!("cross-origin loopback redirect must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("http/request failed"));
+        assert!(
+            redirect_target
+                .received_requests()
+                .await
+                .expect("redirect target requests")
+                .is_empty()
+        );
+        assert!(
+            poison_proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_same_origin_redirect_is_followed_directly_with_bearer() {
+        let target = MockServer::start().await;
+        let poison_proxy = MockServer::start().await;
+        Mock::given(path("/start"))
+            .and(header("authorization", "Bearer personal-browser-secret"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/done"))
+            .expect(1)
+            .mount(&target)
+            .await;
+        Mock::given(path("/done"))
+            .and(header("authorization", "Bearer personal-browser-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("done"))
+            .expect(1)
+            .mount(&target)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(502).set_body_string("proxy observed request"))
+            .expect(0)
+            .mount(&poison_proxy)
+            .await;
+
+        let runner = ReqwestHttpRequestRunner {
+            client: build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+                reqwest::Client::builder()
+                    .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid proxy URL")),
+            ))
+            .expect("proxied client"),
+            loopback_client: build_reqwest_client_with_custom_ca(
+                with_chatgpt_cloudflare_cookie_store(
+                    reqwest::Client::builder()
+                        .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid proxy URL"))
+                        .no_proxy()
+                        .redirect(loopback_same_origin_redirect_policy()),
+                ),
+            )
+            .expect("direct loopback client"),
+        };
+
+        let (response, pending) = runner
+            .run(HttpRequestParams {
+                method: "GET".to_string(),
+                url: format!("{}/start", target.uri()),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer personal-browser-secret".to_string(),
+                }],
+                body: None,
+                timeout_ms: Some(2_000),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "loopback-same-origin-redirect".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect("same-origin loopback redirect succeeds directly");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.0, b"done");
         assert!(pending.is_none());
         assert!(
             poison_proxy

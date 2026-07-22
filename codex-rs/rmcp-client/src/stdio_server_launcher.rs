@@ -219,6 +219,60 @@ const PROCESS_GROUP_KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+#[cfg(any(windows, test))]
+fn confirm_process_absent_after_failed_taskkill(
+    pid: u32,
+    taskkill_status: &str,
+    process_is_running: io::Result<bool>,
+) -> io::Result<()> {
+    match process_is_running {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(io::Error::other(format!(
+            "taskkill exited with status {taskkill_status}; MCP process tree rooted at PID {pid} is still running"
+        ))),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "taskkill exited with status {taskkill_status}; could not confirm that MCP process tree rooted at PID {pid} exited: {error}"
+            ),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_running(pid: u32) -> io::Result<bool> {
+    // `taskkill` uses localized error text, so do not infer "not found" from
+    // its stderr. `tasklist`'s CSV fields keep the numeric PID machine-readable
+    // across locales. A successful query without that exact PID confirms that
+    // the process has already exited; query failures remain ambiguous.
+    let output = std::process::Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .arg("/FO")
+        .arg("CSV")
+        .arg("/NH")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tasklist exited with status {}",
+            output.status
+        )));
+    }
+
+    // Redirected tasklist output can use the active Windows code page. Match
+    // only the ASCII CSV PID field so decoding localized text is unnecessary.
+    Ok(tasklist_csv_contains_pid(&output.stdout, pid))
+}
+
+#[cfg(any(windows, test))]
+fn tasklist_csv_contains_pid(output: &[u8], pid: u32) -> bool {
+    let pid_field = format!(",\"{pid}\",").into_bytes();
+    output
+        .windows(pid_field.len())
+        .any(|window| window == pid_field)
+}
+
 #[cfg(unix)]
 struct LocalProcessTerminator {
     process_group_id: u32,
@@ -415,12 +469,19 @@ impl LocalProcessTerminator {
             .stderr(Stdio::null())
             .status()?;
         if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "taskkill exited with status {status}"
-            )))
+            return Ok(());
         }
+
+        // Shutdown is idempotent: the tracked process can exit between the
+        // transport closing and taskkill running. Accept a nonzero taskkill
+        // only when a separate process-table query confirms that PID is gone.
+        // A live PID or a failed query leaves the process tree's state
+        // uncertain and must remain an error.
+        confirm_process_absent_after_failed_taskkill(
+            self.pid,
+            &status.to_string(),
+            windows_process_is_running(self.pid),
+        )
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -667,6 +728,56 @@ mod tests {
     use codex_protocol::config_types::EnvironmentVariablePattern;
     use codex_protocol::config_types::ShellEnvironmentPolicy;
     use codex_protocol::shell_environment;
+
+    #[test]
+    fn failed_taskkill_is_idempotent_when_process_is_confirmed_absent() {
+        let result = confirm_process_absent_after_failed_taskkill(42, "exit code: 128", Ok(false));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn failed_taskkill_remains_an_error_when_process_is_live() {
+        let error = confirm_process_absent_after_failed_taskkill(42, "exit code: 1", Ok(true))
+            .expect_err("a live process must not be treated as terminated");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("PID 42 is still running"));
+    }
+
+    #[test]
+    fn failed_taskkill_remains_an_error_when_process_state_is_ambiguous() {
+        let error = confirm_process_absent_after_failed_taskkill(
+            42,
+            "exit code: 1",
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process table unavailable",
+            )),
+        )
+        .expect_err("an unsuccessful process query must remain an error");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("could not confirm"));
+        assert!(error.to_string().contains("process table unavailable"));
+    }
+
+    #[test]
+    fn tasklist_csv_pid_probe_matches_only_the_exact_pid_field() {
+        let output = br#""mcp-server.exe","42","Console","1","1,024 K"
+"other.exe","420","Console","1","1,024 K""#;
+
+        assert!(tasklist_csv_contains_pid(output, 42));
+        assert!(tasklist_csv_contains_pid(output, 420));
+        assert!(!tasklist_csv_contains_pid(output, 4));
+    }
+
+    #[test]
+    fn tasklist_csv_pid_probe_treats_localized_no_match_text_as_absent() {
+        let localized_no_match = b"INFO: no matching process (localized text may vary)";
+
+        assert!(!tasklist_csv_contains_pid(localized_no_match, 42));
+    }
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {
