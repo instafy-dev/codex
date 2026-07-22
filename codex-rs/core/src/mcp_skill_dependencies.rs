@@ -199,8 +199,12 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
         return;
     }
-    sess.refresh_mcp_servers_now(turn_context, &refresh_config, elicitation_reviewer)
-        .await;
+    if let Err(error) = sess
+        .refresh_mcp_servers_now(turn_context, &refresh_config, elicitation_reviewer)
+        .await
+    {
+        warn!("failed to refresh MCP dependencies for mentioned skills: {error:#}");
+    }
 }
 
 async fn should_install_mcp_dependencies(

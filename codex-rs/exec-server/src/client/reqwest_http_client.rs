@@ -6,6 +6,7 @@
 //!   orchestrator has forwarded `http/request` over JSON-RPC
 
 use std::error::Error as StdError;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
@@ -51,12 +52,14 @@ pub(crate) struct PendingReqwestHttpBodyStream {
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct ReqwestHttpRequestRunner {
     client: reqwest::Client,
+    loopback_client: reqwest::Client,
 }
 
 impl ReqwestHttpClient {
     fn build_client(
         timeout_ms: Option<u64>,
         redirect_policy: HttpRedirectPolicy,
+        disable_proxy: bool,
     ) -> Result<reqwest::Client, ExecServerError> {
         let builder = match timeout_ms {
             None => reqwest::Client::builder(),
@@ -68,7 +71,13 @@ impl ReqwestHttpClient {
             HttpRedirectPolicy::Follow => builder,
             HttpRedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
         };
-        build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(builder))
+        let mut builder = with_chatgpt_cloudflare_cookie_store(builder);
+        if disable_proxy {
+            // Local MCP capabilities can carry bearer credentials. Never let an ambient
+            // HTTP(S)_PROXY observe those headers before the destination Host policy runs.
+            builder = builder.no_proxy();
+        }
+        build_reqwest_client_with_custom_ca(builder)
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
     }
 }
@@ -126,9 +135,14 @@ impl ReqwestHttpRequestRunner {
         timeout_ms: Option<u64>,
         redirect_policy: HttpRedirectPolicy,
     ) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::build_client(timeout_ms, redirect_policy)
+        let client = ReqwestHttpClient::build_client(timeout_ms, redirect_policy, false)
             .map_err(|error| internal_error(error.to_string()))?;
-        Ok(Self { client })
+        let loopback_client = ReqwestHttpClient::build_client(timeout_ms, redirect_policy, true)
+            .map_err(|error| internal_error(error.to_string()))?;
+        Ok(Self {
+            client,
+            loopback_client,
+        })
     }
 
     pub(crate) async fn run(
@@ -160,7 +174,12 @@ impl ReqwestHttpRequestRunner {
         );
         let mut headers = Self::build_headers(params.headers)?;
         codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
-        let mut request = self.client.request(method.clone(), url).headers(headers);
+        let client = if url_is_loopback(&url) {
+            &self.loopback_client
+        } else {
+            &self.client
+        };
+        let mut request = client.request(method.clone(), url).headers(headers);
         if let Some(body) = params.body {
             request = request.body(body.into_inner());
         }
@@ -301,6 +320,20 @@ impl ReqwestHttpRequestRunner {
     }
 }
 
+fn url_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn log_send_error(method: &Method, error: reqwest::Error) {
     let error = error.without_url();
     let source_chain = error_source_chain(&error);
@@ -322,4 +355,146 @@ fn error_source_chain(error: &reqwest::Error) -> Option<String> {
         source = error.source();
     }
     (!sources.is_empty()).then(|| sources.join(": "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::any;
+    use wiremock::matchers::header;
+
+    #[test]
+    fn loopback_urls_are_selected_for_direct_proxy_bypass() {
+        for value in [
+            "http://127.0.0.1:4321/mcp",
+            "http://127.9.8.7/mcp",
+            "http://[::1]:4321/mcp",
+            "https://localhost/mcp",
+        ] {
+            assert!(url_is_loopback(&Url::parse(value).expect("valid test URL")));
+        }
+        for value in [
+            "https://example.com/mcp",
+            "http://192.168.1.5/mcp",
+            "http://localhost.example/mcp",
+        ] {
+            assert!(!url_is_loopback(
+                &Url::parse(value).expect("valid test URL")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_request_and_bearer_never_reach_a_configured_poison_proxy() {
+        let target = MockServer::start().await;
+        let poison_proxy = MockServer::start().await;
+        Mock::given(any())
+            .and(header("authorization", "Bearer personal-browser-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("target"))
+            .expect(1)
+            .mount(&target)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(502).set_body_string("proxy observed request"))
+            .mount(&poison_proxy)
+            .await;
+
+        let proxied_builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid poison proxy URL"));
+        let direct_builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(poison_proxy.uri()).expect("valid poison proxy URL"))
+            .no_proxy();
+        let runner = ReqwestHttpRequestRunner {
+            client: build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+                proxied_builder,
+            ))
+            .expect("proxied client"),
+            loopback_client: build_reqwest_client_with_custom_ca(
+                with_chatgpt_cloudflare_cookie_store(direct_builder),
+            )
+            .expect("direct loopback client"),
+        };
+
+        let (response, pending) = runner
+            .run(HttpRequestParams {
+                method: "GET".to_string(),
+                url: format!("{}/mcp", target.uri()),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer personal-browser-secret".to_string(),
+                }],
+                body: None,
+                timeout_ms: Some(2_000),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "loopback-no-proxy".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect("loopback request succeeds directly");
+
+        assert_eq!(response.status, 200);
+        assert!(pending.is_none());
+        assert!(
+            poison_proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_request_keeps_using_the_configured_proxy() {
+        let proxy = MockServer::start().await;
+        Mock::given(any())
+            .and(header("authorization", "Bearer remote-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("proxy"))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+
+        let proxied_builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy.uri()).expect("valid proxy URL"));
+        let runner = ReqwestHttpRequestRunner {
+            client: build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+                proxied_builder,
+            ))
+            .expect("proxied client"),
+            loopback_client: build_reqwest_client_with_custom_ca(
+                with_chatgpt_cloudflare_cookie_store(reqwest::Client::builder().no_proxy()),
+            )
+            .expect("direct loopback client"),
+        };
+
+        let (response, pending) = runner
+            .run(HttpRequestParams {
+                method: "GET".to_string(),
+                url: "http://mcp.example.test/resource".to_string(),
+                headers: vec![HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: "Bearer remote-secret".to_string(),
+                }],
+                body: None,
+                timeout_ms: Some(2_000),
+                redirect_policy: HttpRedirectPolicy::Follow,
+                request_id: "remote-through-proxy".to_string(),
+                stream_response: false,
+            })
+            .await
+            .expect("non-loopback request succeeds through proxy");
+
+        assert_eq!(response.status, 200);
+        assert!(pending.is_none());
+        assert_eq!(
+            proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .len(),
+            1
+        );
+    }
 }

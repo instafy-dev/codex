@@ -34,6 +34,7 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionSet;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeContext;
+use codex_mcp::McpRuntimeRefresh;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -112,25 +113,31 @@ impl SessionServices {
         ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
         connections: McpConnectionSet,
     ) -> Result<()> {
-        let runtime = self.publish_mcp_runtime(
-            config,
-            plugins_available,
-            runtime_context,
-            ready_selected_capability_roots,
-            connections,
-        );
+        let refresh = self.mcp_runtime.begin_refresh()?;
+        let runtime = self
+            .publish_mcp_runtime(
+                refresh,
+                config,
+                plugins_available,
+                runtime_context,
+                ready_selected_capability_roots,
+                connections,
+            )
+            .await?;
         runtime.manager().validate_required_servers().await
     }
 
-    pub(crate) fn publish_mcp_runtime(
+    pub(crate) async fn publish_mcp_runtime(
         &self,
+        refresh: McpRuntimeRefresh<'_>,
         config: Arc<McpConfig>,
         plugins_available: bool,
         runtime_context: McpRuntimeContext,
         ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
         connections: McpConnectionSet,
-    ) -> Arc<McpRuntimeSnapshot> {
-        let connections = self.mcp_runtime.replace(connections);
+    ) -> Result<Arc<McpRuntimeSnapshot>> {
+        let publication = refresh.publish(connections)?;
+        let connections = publication.connections();
         let runtime = Arc::new(McpRuntimeSnapshot::new(
             config,
             plugins_available,
@@ -139,7 +146,8 @@ impl SessionServices {
             ready_selected_capability_roots,
         ));
         self.mcp_runtime_snapshot.store(Some(Arc::clone(&runtime)));
-        runtime
+        publication.confirm().await?;
+        Ok(runtime)
     }
 
     pub(crate) fn latest_mcp_runtime(&self) -> Arc<McpRuntimeSnapshot> {

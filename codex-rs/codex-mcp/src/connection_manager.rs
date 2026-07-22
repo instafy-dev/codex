@@ -435,17 +435,39 @@ impl McpConnectionSet {
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_confirmed().await {
+            warn!("MCP shutdown was not fully confirmed: {error:#}");
+        }
+    }
+
+    /// Stop all clients and fail if any MCP process cannot be confirmed terminated.
+    pub async fn shutdown_confirmed(&self) -> Result<()> {
         self.startup_cancellation_token.cancel();
-        let clients = self.clients.values().cloned().collect::<Vec<_>>();
+        let clients = self
+            .clients
+            .iter()
+            .map(|(server_name, client)| (server_name.clone(), client.clone()))
+            .collect::<Vec<_>>();
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
-            for client in clients {
-                client.shutdown().await;
+            let mut failures = Vec::new();
+            for (server_name, client) in clients {
+                if let Err(error) = client.shutdown_confirmed().await {
+                    failures.push(format!("{server_name}: {error:#}"));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "one or more MCP servers failed confirmed shutdown: {}",
+                    failures.join("; ")
+                ))
             }
         });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
-        }
+        shutdown_task
+            .await
+            .context("MCP client shutdown task failed")?
     }
 
     pub fn server_origin(&self, server_name: &str) -> Option<&str> {

@@ -190,14 +190,22 @@ impl Session {
                 .store(Some(Arc::clone(&runtime)));
             return runtime;
         }
-        self.refresh_mcp_servers_inner(
-            turn_context,
-            mcp_projection,
-            environments,
-            &ready_selected_capability_roots,
-            Some(self.mcp_elicitation_reviewer()),
-        )
-        .await
+        match self
+            .refresh_mcp_servers_inner(
+                turn_context,
+                mcp_projection,
+                environments,
+                &ready_selected_capability_roots,
+                Some(self.mcp_elicitation_reviewer()),
+            )
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                warn!(%error, "MCP runtime refresh failed while resolving a step");
+                self.services.latest_mcp_runtime()
+            }
+        }
     }
 
     #[tracing::instrument(
@@ -412,7 +420,7 @@ impl Session {
         environments: &TurnEnvironmentSnapshot,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) -> Arc<McpRuntimeSnapshot> {
+    ) -> anyhow::Result<Arc<McpRuntimeSnapshot>> {
         let auth = self.services.auth_manager.auth().await;
         let McpRuntimeProjection {
             config: mcp_config,
@@ -433,6 +441,7 @@ impl Session {
                 turn_context.cwd.to_path_buf()
             });
         let mcp_runtime_context = McpRuntimeContext::new(environment_manager, cwd);
+        let refresh = self.services.mcp_runtime.begin_refresh()?;
         let mcp_startup_cancellation_token = {
             let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
             // The previous runtime owns the old token and may still be serving an in-flight step.
@@ -474,13 +483,16 @@ impl Session {
         .await;
         refreshed_manager
             .set_elicitations_auto_deny(current_runtime.manager().elicitations_auto_deny());
-        self.services.publish_mcp_runtime(
-            mcp_config,
-            plugins_available,
-            mcp_runtime_context,
-            ready_selected_capability_roots.to_vec(),
-            refreshed_manager,
-        )
+        self.services
+            .publish_mcp_runtime(
+                refresh,
+                mcp_config,
+                plugins_available,
+                mcp_runtime_context,
+                ready_selected_capability_roots.to_vec(),
+                refreshed_manager,
+            )
+            .await
     }
 
     #[expect(
@@ -491,10 +503,10 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+    ) -> anyhow::Result<()> {
         let refresh_config = { self.pending_mcp_server_refresh_config.lock().await.take() };
         let Some(refresh_config) = refresh_config else {
-            return;
+            return Ok(());
         };
 
         let McpServerRefreshConfig {
@@ -507,8 +519,9 @@ impl Session {
             match serde_json::from_value::<HashMap<String, McpServerConfig>>(mcp_servers) {
                 Ok(servers) => servers,
                 Err(err) => {
-                    warn!("failed to parse MCP server refresh config: {err}");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "failed to parse MCP server refresh config: {err}"
+                    ));
                 }
             };
         let store_mode = match serde_json::from_value::<OAuthCredentialsStoreMode>(
@@ -516,16 +529,18 @@ impl Session {
         ) {
             Ok(mode) => mode,
             Err(err) => {
-                warn!("failed to parse MCP OAuth refresh config: {err}");
-                return;
+                return Err(anyhow::anyhow!(
+                    "failed to parse MCP OAuth refresh config: {err}"
+                ));
             }
         };
         let keyring_backend_kind =
             match serde_json::from_value::<AuthKeyringBackendKind>(auth_keyring_backend_kind) {
                 Ok(kind) => kind,
                 Err(err) => {
-                    warn!("failed to parse MCP auth keyring backend refresh config: {err}");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "failed to parse MCP auth keyring backend refresh config: {err}"
+                    ));
                 }
             };
 
@@ -539,8 +554,9 @@ impl Session {
             .features
             .set_enabled(Feature::SecretAuthStorage, secret_auth_storage_enabled)
         {
-            warn!("failed to apply MCP auth keyring backend refresh config: {err}");
-            return;
+            return Err(anyhow::anyhow!(
+                "failed to apply MCP auth keyring backend refresh config: {err}"
+            ));
         }
 
         let _guard = self.services.mcp_projection_lock.lock().await;
@@ -576,7 +592,8 @@ impl Session {
             &ready_selected_capability_roots,
             elicitation_reviewer,
         )
-        .await;
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn set_openai_form_elicitation_support(
@@ -616,7 +633,7 @@ impl Session {
         turn_context: &TurnContext,
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+    ) -> anyhow::Result<()> {
         let _guard = self.services.mcp_projection_lock.lock().await;
         let current_runtime = self.services.latest_mcp_runtime();
         let ready_selected_capability_roots =
@@ -646,7 +663,8 @@ impl Session {
             &ready_selected_capability_roots,
             elicitation_reviewer,
         )
-        .await;
+        .await
+        .map(|_| ())
     }
 
     fn available_selected_environment_ids(

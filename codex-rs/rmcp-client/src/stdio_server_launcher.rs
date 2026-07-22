@@ -27,6 +27,8 @@ use std::thread::sleep;
 use std::thread::spawn;
 #[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -41,6 +43,8 @@ use codex_utils_path_uri::PathUri;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
 #[cfg(unix)]
+use codex_utils_pty::process_group::process_group_exists;
+#[cfg(unix)]
 use codex_utils_pty::process_group::terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -52,6 +56,8 @@ use rmcp::transport::child_process::TokioChildProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+#[cfg(unix)]
+use tokio::time::sleep as async_sleep;
 use tracing::info;
 use tracing::warn;
 
@@ -129,11 +135,13 @@ impl Transport<RoleClient> for StdioServerTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.process.terminate().await?;
-        match &mut self.inner {
+        let transport_result = match &mut self.inner {
             StdioServerTransportInner::Local(transport) => transport.close().await,
             StdioServerTransportInner::Executor(transport) => transport.close().await,
-        }
+        };
+        let process_result = self.process.terminate().await;
+        transport_result?;
+        process_result
     }
 }
 
@@ -206,6 +214,10 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const PROCESS_GROUP_KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[cfg(unix)]
 struct LocalProcessTerminator {
@@ -325,7 +337,7 @@ impl LocalProcessTerminator {
     }
 
     #[cfg(unix)]
-    fn terminate(&self) {
+    fn terminate_on_drop(&self) {
         let process_group_id = self.process_group_id;
         let should_escalate = match terminate_process_group(process_group_id) {
             Ok(exists) => exists,
@@ -345,7 +357,7 @@ impl LocalProcessTerminator {
     }
 
     #[cfg(windows)]
-    fn terminate(&self) {
+    fn terminate_on_drop(&self) {
         let _ = std::process::Command::new("taskkill")
             .arg("/PID")
             .arg(self.pid.to_string())
@@ -358,7 +370,63 @@ impl LocalProcessTerminator {
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {}
+    fn terminate_on_drop(&self) {}
+
+    #[cfg(unix)]
+    async fn terminate_and_confirm(&self) -> io::Result<()> {
+        if !terminate_process_group(self.process_group_id)? {
+            return Ok(());
+        }
+
+        let graceful_deadline = Instant::now() + PROCESS_GROUP_TERM_GRACE_PERIOD;
+        while Instant::now() < graceful_deadline {
+            if !process_group_exists(self.process_group_id)? {
+                return Ok(());
+            }
+            async_sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+        }
+
+        kill_process_group(self.process_group_id)?;
+        let kill_deadline = Instant::now() + PROCESS_GROUP_KILL_CONFIRM_TIMEOUT;
+        while Instant::now() < kill_deadline {
+            if !process_group_exists(self.process_group_id)? {
+                return Ok(());
+            }
+            async_sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "MCP process group {} remained after SIGKILL",
+                self.process_group_id
+            ),
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn terminate_and_confirm(&self) -> io::Result<()> {
+        let status = std::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(self.pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "taskkill exited with status {status}"
+            )))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    async fn terminate_and_confirm(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl StdioServerProcessHandle {
@@ -383,24 +451,24 @@ impl StdioServerProcessHandle {
     }
 
     pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if self.inner.terminated.swap(true, Ordering::AcqRel) {
+        if self.inner.terminated.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        match &self.inner.kind {
+        let result = match &self.inner.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-                Ok(())
+                terminator.terminate_and_confirm().await
             }
             StdioServerProcessKind::Local(None) => Ok(()),
             StdioServerProcessKind::Executor(process) => match process.terminate().await {
                 Ok(()) => Ok(()),
-                Err(error) => {
-                    self.inner.terminated.store(false, Ordering::Release);
-                    Err(io::Error::other(error))
-                }
+                Err(error) => Err(io::Error::other(error)),
             },
+        };
+        if result.is_ok() {
+            self.inner.terminated.store(true, Ordering::Release);
         }
+        result
     }
 }
 
@@ -412,7 +480,7 @@ impl Drop for StdioServerProcessHandleInner {
 
         match &self.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
+                terminator.terminate_on_drop();
             }
             StdioServerProcessKind::Local(None) => {}
             StdioServerProcessKind::Executor(process) => {

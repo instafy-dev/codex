@@ -43,7 +43,6 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -85,7 +84,16 @@ pub async fn user_input_or_turn(
     op: Op,
     client_user_message_id: Option<String>,
 ) {
-    user_input_or_turn_inner(sess, sub_id, op, client_user_message_id).await;
+    // Keep the large turn-construction future out of this wrapper's async frame. In debug builds,
+    // polling the fully inlined submission -> user-input -> turn path can exceed a normal 2 MiB
+    // worker stack before any model request is made.
+    Box::pin(user_input_or_turn_inner(
+        sess,
+        sub_id,
+        op,
+        client_user_message_id,
+    ))
+    .await;
 }
 
 pub async fn update_thread_settings(
@@ -198,7 +206,8 @@ pub(super) async fn user_input_or_turn_inner(
     };
     updates.final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
+    let Ok(current_context) = Box::pin(sess.new_turn_with_sub_id(sub_id.clone(), updates)).await
+    else {
         // new_turn_with_sub_id already emits the error event.
         return;
     };
@@ -231,11 +240,24 @@ pub(super) async fn user_input_or_turn_inner(
                     .set_responsesapi_client_metadata(responsesapi_client_metadata);
             }
             current_context.session_telemetry.user_prompt(&items);
-            sess.refresh_mcp_servers_if_requested(
-                &current_context,
-                Some(sess.mcp_elicitation_reviewer()),
-            )
-            .await;
+            if let Err(error) = sess
+                .refresh_mcp_servers_if_requested(
+                    &current_context,
+                    Some(sess.mcp_elicitation_reviewer()),
+                )
+                .await
+            {
+                warn!(%error, "MCP server refresh cleanup could not be confirmed");
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: format!("MCP server refresh failed: {error:#}"),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                })
+                .await;
+                return;
+            }
             let additional_context_input = {
                 let mut state = sess.state.lock().await;
                 state.additional_context.merge(additional_context)
@@ -579,23 +601,51 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "MCP publication and confirmed terminal shutdown must remain serialized"
+)]
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> anyhow::Result<()> {
+    sess.begin_shutdown();
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
-    let _ = sess.conversation.shutdown().await;
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.abort_all_tasks_for_shutdown().await;
+    let mut failures = Vec::new();
+    if let Err(error) = sess.conversation.shutdown().await {
+        failures.push(format!("realtime conversation: {error}"));
+    }
     sess.services
         .unified_exec_manager
         .terminate_all_processes()
         .await;
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
-        warn!("failed to shutdown code mode session: {err}");
+        failures.push(format!("code mode session: {err}"));
     }
-    sess.services.mcp_runtime.shutdown().await;
+    // Every MCP refresh path holds this lock across process construction and
+    // publication. Taking it after task join closes the last publication race;
+    // a cancelled construction taints McpRuntime and makes confirmation fail.
+    {
+        let _projection = sess.services.mcp_projection_lock.lock().await;
+        if let Err(error) = sess.services.mcp_runtime.shutdown_confirmed().await {
+            failures.push(format!("MCP runtime: {error:#}"));
+        }
+    }
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    if sess.active_turn.lock().await.is_some() {
+        failures.push("an active turn remained after task shutdown".to_string());
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Codex shutdown cleanup could not be confirmed: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -610,7 +660,7 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+    let shutdown_result = shutdown_session_runtime(sess).await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -642,6 +692,25 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         sess.send_event_raw(event).await;
     }
 
+    if let Err(error) = shutdown_result {
+        warn!(%error, "Codex shutdown cleanup could not be confirmed");
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: "Codex shutdown cleanup could not be confirmed".to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        };
+        sess.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        sess.deliver_event_raw(event).await;
+        sess.services
+            .rollout_thread_trace
+            .record_ended(codex_rollout_trace::RolloutStatus::Failed);
+        return true;
+    }
+
     let event = Event {
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
@@ -665,8 +734,21 @@ pub async fn review(
     let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
-    sess.refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
+    if let Err(error) = sess
+        .refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
+        .await
+    {
+        warn!(%error, "MCP server refresh cleanup could not be confirmed");
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: format!("MCP server refresh failed: {error:#}"),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        })
         .await;
+        return;
+    }
     #[allow(deprecated)]
     match resolve_review_request(review_request, &turn_context.cwd) {
         Ok(resolved) => {
@@ -748,8 +830,13 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::UserInput { .. } => {
-                    user_input_or_turn(&sess, sub.id.clone(), sub.op, sub.client_user_message_id)
-                        .await;
+                    Box::pin(user_input_or_turn(
+                        &sess,
+                        sub.id.clone(),
+                        sub.op,
+                        sub.client_user_message_id,
+                    ))
+                    .await;
                     false
                 }
                 Op::ThreadSettings { thread_settings } => {
@@ -841,7 +928,9 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Err(error) = shutdown_session_runtime(&sess).await {
+            warn!(%error, "Codex session teardown after channel close was not confirmed");
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await

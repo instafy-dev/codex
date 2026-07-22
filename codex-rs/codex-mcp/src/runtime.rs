@@ -7,8 +7,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::Result;
+use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
@@ -27,12 +30,42 @@ use crate::McpConnectionSet;
 /// keep the previous connection set alive until their work completes.
 pub struct McpRuntime {
     connections: ArcSwap<McpConnectionSet>,
+    lifecycle: Mutex<McpRuntimeLifecycle>,
+}
+
+#[derive(Default)]
+struct McpRuntimeLifecycle {
+    retired: Vec<Arc<McpConnectionSet>>,
+    refresh_in_progress: bool,
+    refresh_tainted: bool,
+    shutdown_started: bool,
+}
+
+/// Marks the interval in which a replacement connection set may launch processes.
+///
+/// Dropping this guard before publication permanently taints the runtime. A partly
+/// constructed stdio client may otherwise become unreachable before its process group
+/// can be confirmed gone, so terminal shutdown must fail closed in that case.
+pub struct McpRuntimeRefresh<'a> {
+    runtime: &'a McpRuntime,
+    completed: bool,
+}
+
+/// A newly published generation whose predecessor is still being confirmed shut down.
+/// Dropping this value before [`Self::confirm`] taints the runtime and leaves the
+/// predecessor registered for terminal cleanup.
+pub struct McpRuntimePublication<'a> {
+    runtime: &'a McpRuntime,
+    connections: Arc<McpConnectionSet>,
+    previous: Arc<McpConnectionSet>,
+    completed: bool,
 }
 
 impl McpRuntime {
     pub fn new(connections: Arc<McpConnectionSet>) -> Self {
         Self {
             connections: ArcSwap::from(connections),
+            lifecycle: Mutex::new(McpRuntimeLifecycle::default()),
         }
     }
 
@@ -40,14 +73,176 @@ impl McpRuntime {
         self.connections.load_full()
     }
 
-    pub fn replace(&self, connections: McpConnectionSet) -> Arc<McpConnectionSet> {
-        let connections = Arc::new(connections);
-        self.connections.store(Arc::clone(&connections));
-        connections
+    pub fn begin_refresh(&self) -> Result<McpRuntimeRefresh<'_>> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.shutdown_started {
+            return Err(anyhow!("MCP runtime shutdown has already started"));
+        }
+        if lifecycle.refresh_in_progress {
+            lifecycle.refresh_tainted = true;
+            return Err(anyhow!(
+                "another MCP runtime refresh is already in progress"
+            ));
+        }
+        lifecycle.refresh_in_progress = true;
+        Ok(McpRuntimeRefresh {
+            runtime: self,
+            completed: false,
+        })
     }
 
     pub async fn shutdown(&self) {
-        self.snapshot().shutdown().await;
+        if let Err(error) = self.shutdown_confirmed().await {
+            tracing::warn!("MCP runtime shutdown was not fully confirmed: {error:#}");
+        }
+    }
+
+    /// Stop every connection generation and return only when all owned MCP processes
+    /// are confirmed gone. Any interrupted refresh makes confirmation impossible and
+    /// is reported permanently so authority-sensitive callers fail closed.
+    pub async fn shutdown_confirmed(&self) -> Result<()> {
+        let (current, retired, refresh_in_progress, refresh_tainted) = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lifecycle.shutdown_started = true;
+            (
+                self.snapshot(),
+                lifecycle.retired.clone(),
+                lifecycle.refresh_in_progress,
+                lifecycle.refresh_tainted,
+            )
+        };
+
+        let mut failures = Vec::new();
+        if refresh_in_progress {
+            failures.push(
+                "an MCP refresh remains in progress, so its process lifecycle is unconfirmed"
+                    .to_string(),
+            );
+        }
+        if refresh_tainted {
+            failures.push(
+                "an interrupted MCP refresh left a process lifecycle unconfirmed".to_string(),
+            );
+        }
+        if let Err(error) = current.shutdown_confirmed().await {
+            failures.push(format!("current generation: {error:#}"));
+        }
+        for (index, connections) in retired.into_iter().enumerate() {
+            if Arc::ptr_eq(&connections, &current) {
+                continue;
+            }
+            if let Err(error) = connections.shutdown_confirmed().await {
+                failures.push(format!("retired generation {index}: {error:#}"));
+            }
+        }
+
+        if failures.is_empty() {
+            self.lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retired
+                .clear();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "MCP runtime shutdown could not be confirmed: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+}
+
+impl<'a> McpRuntimeRefresh<'a> {
+    pub fn publish(mut self, connections: McpConnectionSet) -> Result<McpRuntimePublication<'a>> {
+        let mut lifecycle = self
+            .runtime
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.shutdown_started {
+            lifecycle.refresh_tainted = true;
+            return Err(anyhow!(
+                "MCP runtime shutdown started before refresh publication"
+            ));
+        }
+        if !lifecycle.refresh_in_progress {
+            lifecycle.refresh_tainted = true;
+            return Err(anyhow!(
+                "MCP runtime refresh publication lost its lifecycle"
+            ));
+        }
+
+        let connections = Arc::new(connections);
+        let previous = self.runtime.connections.swap(Arc::clone(&connections));
+        lifecycle.retired.push(Arc::clone(&previous));
+        self.completed = true;
+        Ok(McpRuntimePublication {
+            runtime: self.runtime,
+            connections,
+            previous,
+            completed: false,
+        })
+    }
+}
+
+impl Drop for McpRuntimeRefresh<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut lifecycle = self
+            .runtime
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.refresh_in_progress = false;
+        lifecycle.refresh_tainted = true;
+    }
+}
+
+impl McpRuntimePublication<'_> {
+    pub fn connections(&self) -> Arc<McpConnectionSet> {
+        Arc::clone(&self.connections)
+    }
+
+    /// Confirm the previous generation is gone before completing the refresh.
+    pub async fn confirm(mut self) -> Result<()> {
+        self.previous.shutdown_confirmed().await.map_err(|error| {
+            anyhow!("previous MCP generation shutdown could not be confirmed: {error:#}")
+        })?;
+
+        let mut lifecycle = self
+            .runtime
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle
+            .retired
+            .retain(|connections| !Arc::ptr_eq(connections, &self.previous));
+        lifecycle.refresh_in_progress = false;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for McpRuntimePublication<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut lifecycle = self
+            .runtime
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.refresh_in_progress = false;
+        lifecycle.refresh_tainted = true;
     }
 }
 
@@ -376,5 +571,130 @@ mod tests {
             Err(error) => panic!("local stdio MCP should resolve: {error}"),
         };
         assert!(resolved_runtime.is_some());
+    }
+
+    #[tokio::test]
+    async fn interrupted_refresh_prevents_confirmed_shutdown() {
+        let runtime = McpRuntime::new(Arc::new(McpConnectionSet::empty(
+            /*prefix_mcp_tool_names*/ false,
+        )));
+        let refresh = runtime
+            .begin_refresh()
+            .expect("refresh should start before shutdown");
+
+        drop(refresh);
+
+        let error = runtime
+            .shutdown_confirmed()
+            .await
+            .expect_err("an interrupted refresh must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted MCP refresh left a process lifecycle unconfirmed")
+        );
+    }
+
+    #[tokio::test]
+    async fn published_generations_are_retained_until_confirmed_shutdown() {
+        let original = Arc::new(McpConnectionSet::empty(
+            /*prefix_mcp_tool_names*/ false,
+        ));
+        let runtime = McpRuntime::new(Arc::clone(&original));
+        let publication = runtime
+            .begin_refresh()
+            .expect("refresh should start")
+            .publish(McpConnectionSet::empty(
+                /*prefix_mcp_tool_names*/ false,
+            ))
+            .expect("refresh should publish");
+        let published = publication.connections();
+
+        assert!(Arc::ptr_eq(&runtime.snapshot(), &published));
+        assert!(
+            runtime
+                .lifecycle
+                .lock()
+                .expect("lifecycle lock should not be poisoned")
+                .retired
+                .iter()
+                .any(|connections| Arc::ptr_eq(connections, &original))
+        );
+        publication
+            .confirm()
+            .await
+            .expect("previous empty generation should confirm shutdown");
+        runtime
+            .shutdown_confirmed()
+            .await
+            .expect("empty generations should confirm shutdown");
+    }
+
+    #[tokio::test]
+    async fn interrupted_post_publication_cleanup_retains_predecessor_and_fails_closed() {
+        let original = Arc::new(McpConnectionSet::empty(
+            /*prefix_mcp_tool_names*/ false,
+        ));
+        let runtime = McpRuntime::new(Arc::clone(&original));
+        let publication = runtime
+            .begin_refresh()
+            .expect("refresh should start")
+            .publish(McpConnectionSet::empty(
+                /*prefix_mcp_tool_names*/ false,
+            ))
+            .expect("refresh should publish");
+
+        drop(publication);
+
+        let error = runtime
+            .shutdown_confirmed()
+            .await
+            .expect_err("abandoned predecessor cleanup must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted MCP refresh left a process lifecycle unconfirmed")
+        );
+        let lifecycle = runtime
+            .lifecycle
+            .lock()
+            .expect("lifecycle lock should not be poisoned");
+        assert!(lifecycle.refresh_tainted);
+        assert!(!lifecycle.refresh_in_progress);
+        assert!(
+            lifecycle
+                .retired
+                .iter()
+                .any(|connections| Arc::ptr_eq(connections, &original))
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_does_not_clear_earlier_lifecycle_uncertainty() {
+        let runtime = McpRuntime::new(Arc::new(McpConnectionSet::empty(
+            /*prefix_mcp_tool_names*/ false,
+        )));
+        drop(runtime.begin_refresh().expect("first refresh should start"));
+
+        runtime
+            .begin_refresh()
+            .expect("later refresh should still be allowed for cleanup")
+            .publish(McpConnectionSet::empty(
+                /*prefix_mcp_tool_names*/ false,
+            ))
+            .expect("later refresh should publish")
+            .confirm()
+            .await
+            .expect("later predecessor shutdown should confirm");
+
+        let error = runtime
+            .shutdown_confirmed()
+            .await
+            .expect_err("later success must not erase earlier uncertainty");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted MCP refresh left a process lifecycle unconfirmed")
+        );
     }
 }
