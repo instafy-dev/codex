@@ -8,21 +8,28 @@ use tokio::process::Child;
 use tokio::process::Command;
 use winapi::shared::ntdef::NT_SUCCESS;
 use winapi::shared::ntdef::NTSTATUS;
+use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::jobapi2::CreateJobObjectW;
+use winapi::um::jobapi2::QueryInformationJobObject;
 use winapi::um::jobapi2::SetInformationJobObject;
 use winapi::um::jobapi2::TerminateJobObject;
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::processthreadsapi::TerminateProcess;
+use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::CREATE_SUSPENDED;
+use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::HANDLE;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use winapi::um::winnt::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
 use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+use winapi::um::winnt::JobObjectBasicAccountingInformation;
 use winapi::um::winnt::JobObjectExtendedLimitInformation;
 use winapi::um::winnt::PROCESS_SET_QUOTA;
 use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
 use winapi::um::winnt::PROCESS_TERMINATE;
+use winapi::um::winnt::SYNCHRONIZE;
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -68,7 +75,11 @@ impl JobObject {
     /// Captures an owned process handle before its numeric identifier can be reused.
     pub fn open_process_handle(process_id: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
         let handle = unsafe {
-            OpenProcess(PROCESS_TERMINATE, /*bInheritHandle*/ 0, process_id)
+            OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE,
+                /*bInheritHandle*/ 0,
+                process_id,
+            )
         };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
@@ -83,9 +94,44 @@ impl JobObject {
             TerminateProcess(handle.as_raw_handle().cast(), /*uExitCode*/ 1)
         };
         if terminated == 0 {
-            Err(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            if Self::process_has_exited(handle)? {
+                Ok(())
+            } else {
+                Err(error)
+            }
         } else {
             Ok(())
+        }
+    }
+
+    /// Checks termination of the exact captured process, without a reusable numeric PID.
+    fn process_has_exited(handle: &std::os::windows::io::OwnedHandle) -> io::Result<bool> {
+        match unsafe {
+            WaitForSingleObject(handle.as_raw_handle().cast(), /*dwMilliseconds*/ 0)
+        } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Reports whether any member of this contained process tree is still active.
+    pub fn has_running_processes(&self) -> io::Result<bool> {
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses != 0)
         }
     }
 
@@ -230,3 +276,7 @@ impl AsRawHandle for JobObject {
         self.handle.as_raw_handle()
     }
 }
+
+#[cfg(test)]
+#[path = "job_tests.rs"]
+mod tests;

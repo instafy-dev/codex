@@ -133,8 +133,14 @@ impl McpServerConnection {
         self.client.client().await
     }
 
-    async fn shutdown(&self) {
-        self.client.shutdown().await;
+    async fn shutdown_confirmed(&self) -> Result<()> {
+        // A dormant lazy client has not launched a transport. Cancel it without
+        // triggering startup merely to shut it down.
+        if self.startup_is_dormant() {
+            self.client.cancel_token.cancel();
+            return Ok(());
+        }
+        self.client.shutdown_confirmed().await
     }
 
     fn cancel_startup(&self) {
@@ -853,20 +859,56 @@ impl McpConnectionSet {
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_confirmed().await {
+            warn!("MCP shutdown was not fully confirmed: {error:#}");
+        }
+    }
+
+    /// Stop all clients and fail if any MCP process cannot be confirmed terminated.
+    pub async fn shutdown_confirmed(&self) -> Result<()> {
+        self.shutdown_connections_confirmed(/*retained*/ None).await
+    }
+
+    pub(crate) async fn shutdown_replaced_connections_confirmed(
+        &self,
+        retained: &Self,
+    ) -> Result<()> {
+        self.shutdown_connections_confirmed(Some(retained)).await
+    }
+
+    async fn shutdown_connections_confirmed(&self, retained: Option<&Self>) -> Result<()> {
         let connections = self
             .servers
-            .values()
-            .map(|view| Arc::clone(&view.connection))
+            .iter()
+            .filter(|(_, view)| {
+                !retained.is_some_and(|retained| {
+                    retained.servers.values().any(|retained_view| {
+                        Arc::ptr_eq(&view.connection, &retained_view.connection)
+                    })
+                })
+            })
+            .map(|(name, view)| (name.clone(), Arc::clone(&view.connection)))
             .collect::<Vec<_>>();
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
-            for connection in connections {
-                connection.shutdown().await;
+            let mut failures = Vec::new();
+            for (server_name, connection) in connections {
+                if let Err(error) = connection.shutdown_confirmed().await {
+                    failures.push(format!("{server_name}: {error:#}"));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "one or more MCP servers failed confirmed shutdown: {}",
+                    failures.join("; ")
+                ))
             }
         });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
-        }
+        shutdown_task
+            .await
+            .context("MCP client shutdown task failed")?
     }
 
     pub(crate) fn cancel_startup(&self) {

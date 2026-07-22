@@ -6632,6 +6632,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_lifecycle_lock: Mutex::new(()),
+        shutdown_started: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -8937,6 +8939,8 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_lifecycle_lock: Mutex::new(()),
+        shutdown_started: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
@@ -12701,3 +12705,6 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
     Ok(())
 }
+
+#[path = "tests/bounded_shutdown_tests.rs"]
+mod bounded_shutdown_tests;

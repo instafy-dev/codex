@@ -384,6 +384,16 @@ fn submit_nested_tool(
             call_id: call.call_id.clone(),
             cell_id: cell_id.to_string(),
         });
+    let required_execution = exec
+        .turn
+        .extension_data
+        .get::<crate::client::required_execution::RequiredExecution>()
+        .filter(|_| {
+            crate::client::required_execution::is_execution_tool_name(
+                call.tool_name.namespace.as_deref(),
+                &call.tool_name.name,
+            )
+        });
     let result = tool_runtime.handle_tool_call_with_source(
         call,
         ToolCallSource::CodeMode {
@@ -392,7 +402,15 @@ fn submit_nested_tool(
         },
         cancellation_token,
     );
-    Ok(async move { Ok(result.await?.code_mode_result()) })
+    Ok(async move {
+        let result = result.await?;
+        if let Some(required_execution) = required_execution {
+            required_execution
+                .0
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(result.code_mode_result())
+    })
 }
 
 fn build_nested_tool_payload(

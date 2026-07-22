@@ -59,6 +59,10 @@ use crate::server::EffectiveMcpServer;
 use crate::tool_catalog_cache::McpToolCatalogCache;
 use crate::tools::ToolInfo;
 
+mod lifecycle;
+
+use lifecycle::McpRuntimeLifecycle;
+
 /// Controls when one task starts its eligible MCP servers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpStartupPolicy {
@@ -95,6 +99,7 @@ pub struct McpRuntimeInput {
 /// their exact connections and configuration for as long as they are needed.
 pub struct McpRuntime {
     current: ArcSwap<PublishedMcpRuntime>,
+    lifecycle: Mutex<McpRuntimeLifecycle>,
     event_stream_cancellation: Mutex<EventStreamCancellation>,
     reconnect_pending: AtomicBool,
     elicitation_router: ElicitationRequestRouter,
@@ -188,6 +193,7 @@ impl McpRuntime {
                 selected_environments: HashMap::new(),
                 cached_binding: Mutex::new(None),
             }),
+            lifecycle: Mutex::default(),
             event_stream_cancellation: Mutex::new(EventStreamCancellation {
                 event_server_available: false,
                 cancel_event_streams_on_server_removal: watch::channel(()).0,
@@ -265,21 +271,31 @@ impl McpRuntime {
             pending: &self.reconnect_pending,
             claimed: self.reconnect_pending.swap(false, Ordering::AcqRel),
         };
-        self.publish(
-            input,
-            (!reconnect.claimed).then_some(current.connections.as_ref()),
-        )
-        .await;
+        if let Err(error) = self
+            .publish(
+                input,
+                (!reconnect.claimed).then_some(current.connections.as_ref()),
+            )
+            .await
+        {
+            tracing::warn!("MCP runtime refresh cleanup could not be confirmed: {error:#}");
+            return;
+        }
         reconnect.claimed = false;
     }
 
     /// Starts fresh connections and returns their complete, refreshed Apps catalog.
     pub async fn replace_fresh(&self, input: McpRuntimeInput) -> anyhow::Result<Vec<ToolInfo>> {
-        self.publish(input, /*previous*/ None).await;
+        self.publish(input, /*previous*/ None).await?;
         self.latest_hard_refresh_codex_apps_tools_cache().await
     }
 
-    async fn publish(&self, input: McpRuntimeInput, previous: Option<&McpConnectionSet>) {
+    async fn publish(
+        &self,
+        input: McpRuntimeInput,
+        previous: Option<&McpConnectionSet>,
+    ) -> anyhow::Result<()> {
+        let refresh = self.begin_refresh()?;
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let auth = input.auth.clone();
@@ -305,30 +321,34 @@ impl McpRuntime {
                         .source()
                         .is_host_owned_apps(CODEX_APPS_MCP_SERVER_NAME, registration.config())
                 });
-        let mut cancellation = self
-            .event_stream_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.current.store(Arc::new(PublishedMcpRuntime {
-            connections,
-            config: Some(config),
-            auth,
-            auth_token,
-            plugins_available,
-            ready_selected_capability_roots,
-            selected_environments,
-            cached_binding: Mutex::new(None),
-        }));
-        let _ = publish.send(true);
-        cancellation.event_server_available = hosted_event_server_retained;
-        if !hosted_event_server_retained {
-            cancellation
-                .cancel_event_streams_on_server_removal
-                .send_replace(());
-            if let Some(retained) = &cancellation.retained_subscription_cancellation {
-                retained.send_replace(());
+        let previous = {
+            let mut cancellation = self
+                .event_stream_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = refresh.publish(Arc::new(PublishedMcpRuntime {
+                connections: Arc::clone(&connections),
+                config: Some(config),
+                auth,
+                auth_token,
+                plugins_available,
+                ready_selected_capability_roots,
+                selected_environments,
+                cached_binding: Mutex::new(None),
+            }))?;
+            let _ = publish.send(true);
+            cancellation.event_server_available = hosted_event_server_retained;
+            if !hosted_event_server_retained {
+                cancellation
+                    .cancel_event_streams_on_server_removal
+                    .send_replace(());
+                if let Some(retained) = &cancellation.retained_subscription_cancellation {
+                    retained.send_replace(());
+                }
             }
-        }
+            previous
+        };
+        refresh.confirm(previous, connections).await
     }
 
     /// Ensures the next refresh creates fresh connections for every configured server.
@@ -690,7 +710,9 @@ impl McpRuntime {
     }
 
     pub async fn shutdown(&self) {
-        self.latest_connections().shutdown().await;
+        if let Err(error) = self.shutdown_confirmed().await {
+            tracing::warn!("MCP runtime shutdown was not fully confirmed: {error:#}");
+        }
     }
 }
 

@@ -662,11 +662,12 @@ impl Session {
         turn_context: &TurnContext,
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
-            error!("MCP runtime refresh semaphore closed");
-            return;
-        };
+    ) -> anyhow::Result<()> {
+        let _refresh = self
+            .mcp_refresh
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
         let auth = self.services.auth_manager.auth().await;
         {
             let mut state = self.state.lock().await;
@@ -711,6 +712,7 @@ impl Session {
             elicitation_reviewer,
         )
         .await;
+        self.services.mcp_runtime.ensure_refresh_confirmed()
     }
 
     pub(crate) fn ready_selected_capability_roots(

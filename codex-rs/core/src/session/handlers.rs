@@ -39,7 +39,6 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -399,12 +398,16 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) -> anyhow::Result<()> {
+    sess.begin_shutdown();
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
-    let _ = sess.conversation.shutdown().await;
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.abort_all_tasks_for_shutdown().await;
+    let mut failures = Vec::new();
+    if let Err(error) = sess.conversation.shutdown().await {
+        failures.push(format!("realtime conversation: {error}"));
+    }
     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
         shell_snapshot_prewarm.abort();
@@ -417,18 +420,31 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         .unified_exec_manager
         .terminate_all_processes()
         .await;
-    if let Err(err) = sess.services.code_mode_service.shutdown().await {
-        warn!("failed to shutdown code mode session: {err}");
+    if let Err(error) = sess.services.code_mode_service.shutdown().await {
+        failures.push(format!("code mode session: {error}"));
     }
     sess.stop_mcp_prewarm_worker().await;
     {
         let _refresh = sess.mcp_refresh.acquire().await;
         sess.mcp_refresh.close();
-        sess.services.mcp_runtime.shutdown().await;
+        if let Err(error) = sess.services.mcp_runtime.shutdown_confirmed().await {
+            failures.push(format!("MCP runtime: {error:#}"));
+        }
     }
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    if sess.active_turn.lock().await.is_some() {
+        failures.push("an active turn remained after task shutdown".to_string());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Codex shutdown cleanup could not be confirmed: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -443,7 +459,7 @@ pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+    let shutdown_result = shutdown_session_runtime(sess).await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -473,6 +489,26 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
             }),
         };
         sess.send_event_raw(event).await;
+    }
+
+    if let Err(error) = shutdown_result {
+        warn!(%error, "Codex shutdown cleanup could not be confirmed");
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
+                message: "Codex shutdown cleanup could not be confirmed".to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        };
+        sess.services
+            .rollout_thread_trace
+            .record_protocol_event(&event.msg);
+        sess.deliver_event_raw(event).await;
+        sess.services
+            .rollout_thread_trace
+            .record_ended(codex_rollout_trace::RolloutStatus::Failed);
+        return true;
     }
 
     let event = Event {
@@ -728,7 +764,9 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Err(error) = shutdown_session_runtime(&sess).await {
+            warn!(%error, "Codex session teardown after channel close was not confirmed");
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await

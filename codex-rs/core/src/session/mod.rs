@@ -3609,6 +3609,19 @@ impl Session {
         }
         .or_cancel(cancellation_token)
         .await?;
+        {
+            let _refresh = self.mcp_refresh.acquire().await.map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "MCP refresh gate closed before tool activation: {error}"
+                ))
+            })?;
+            self.services
+                .mcp_runtime
+                .ensure_refresh_confirmed()
+                .map_err(|error| {
+                    CodexErr::Fatal(format!("MCP server refresh failed: {error:#}"))
+                })?;
+        }
         let mut selected_plugins = self
             .services
             .thread_extension_data

@@ -6574,3 +6574,128 @@ text(JSON.stringify({
 
     Ok(())
 }
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn astra_requires_nested_execution_after_helper_only_code_and_preserves_max() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let helper_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-instafy-helper"),
+            ev_custom_tool_call(
+                "call-instafy-helper",
+                "exec",
+                r#"
+text(await tools.update_plan({plan: [{step: "Run the requested command", status: "in_progress"}]}));
+"#,
+            ),
+            ev_completed("resp-instafy-helper"),
+        ]),
+    )
+    .await;
+    let execution_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-instafy-execution"),
+            ev_custom_tool_call(
+                "call-instafy-execution",
+                "exec",
+                r#"
+const result = await tools.exec_command({cmd: "printf instafy_required_execution_marker"});
+text(result.output);
+"#,
+            ),
+            ev_completed("resp-instafy-execution"),
+        ]),
+    )
+    .await;
+    let final_request = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-instafy-done", "done"),
+            ev_completed("resp-instafy-done"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_model("gpt-6-astra")
+        .with_config(|config| {
+            config.model_reasoning_effort =
+                Some(codex_protocol::openai_models::ReasoningEffort::Max);
+            config.update_plan_enabled = true;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let turn_request = TurnInputRequest::user_input(vec![UserInput::Text {
+        text: "Run the requested command before responding".to_string(),
+        text_elements: Vec::new(),
+    }])
+    .with_responses_metadata(Some(HashMap::from([(
+        "codex.required_tool".to_string(),
+        "command_once".to_string(),
+    )])));
+    test.codex.start_or_steer_turn(turn_request.clone()).await?;
+    loop {
+        let event = test.codex.next_event().await?;
+        match event.msg {
+            EventMsg::Warning(warning) => assert!(
+                !warning.message.contains("Model metadata")
+                    && !warning.message.contains("fallback metadata"),
+                "Astra should resolve bundled metadata: {}",
+                warning.message,
+            ),
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    let first = helper_request.single_request().body_json();
+    let second = execution_request.single_request().body_json();
+    let final_body = final_request.single_request().body_json();
+    assert_eq!(
+        (
+            &first["tool_choice"],
+            &second["tool_choice"],
+            &final_body["tool_choice"]
+        ),
+        (
+            &serde_json::json!("required"),
+            &serde_json::json!("required"),
+            &serde_json::json!("auto")
+        )
+    );
+    assert_eq!(first["model"], "gpt-6-astra");
+    assert_eq!(first["reasoning"]["effort"], "max");
+    let (output, success) = custom_tool_output_body_and_success(
+        &final_request.single_request(),
+        "call-instafy-execution",
+    );
+    assert_ne!(
+        success,
+        Some(false),
+        "nested execution should succeed: {output}"
+    );
+    assert_eq!(output, "instafy_required_execution_marker");
+
+    let next_turn = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-instafy-next-turn"),
+            ev_completed("resp-instafy-next-turn"),
+        ]),
+    )
+    .await;
+    test.codex.start_or_steer_turn(turn_request).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        next_turn.single_request().body_json()["tool_choice"],
+        "required"
+    );
+    Ok(())
+}

@@ -34,6 +34,7 @@ use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_skills::SkillError;
 use codex_utils_git_discovery::GitRootDiscovery;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Semaphore;
 
 /// Context for an initialized model agent
@@ -67,6 +68,10 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Serializes task installation with abort/join so shutdown cannot observe
+    /// an empty active turn while a new task is being published.
+    pub(crate) task_lifecycle_lock: Mutex<()>,
+    pub(crate) shutdown_started: AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
@@ -1518,6 +1523,8 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
+                task_lifecycle_lock: Mutex::new(()),
+                shutdown_started: AtomicBool::new(false),
                 async_hook_results,
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),

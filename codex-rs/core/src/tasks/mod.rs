@@ -268,23 +268,47 @@ where
 }
 
 impl Session {
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn shutdown_has_started(&self) -> bool {
+        self.shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
+        if self.shutdown_has_started() {
+            return;
+        }
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
+        if self.shutdown_has_started() {
+            return;
+        }
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "task publication must remain serialized with abort and shutdown"
+    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _task_lifecycle = self.task_lifecycle_lock.lock().await;
+        if self.shutdown_has_started() {
+            return;
+        }
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
         turn_context
@@ -442,6 +466,9 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        if self.shutdown_has_started() {
+            return;
+        }
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
@@ -451,7 +478,7 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            if self.shutdown_has_started() || active_turn.is_some() {
                 return;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
@@ -507,6 +534,30 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        self.abort_all_tasks_inner(reason, /*resume_pending_work*/ true)
+            .await;
+    }
+
+    /// Abort and join the active task without promoting queued trigger work into
+    /// a replacement turn. Terminal shutdown is the only caller.
+    pub(crate) async fn abort_all_tasks_for_shutdown(self: &Arc<Self>) {
+        self.abort_all_tasks_inner(
+            TurnAbortReason::Interrupted,
+            /*resume_pending_work*/ false,
+        )
+        .await;
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "task cancellation and join must remain serialized with task publication"
+    )]
+    async fn abort_all_tasks_inner(
+        self: &Arc<Self>,
+        reason: TurnAbortReason,
+        resume_pending_work: bool,
+    ) {
+        let task_lifecycle = self.task_lifecycle_lock.lock().await;
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
         let mut turn_context = None;
@@ -532,16 +583,22 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             self.input_queue.clear_pending(&active_turn).await;
         }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
+        drop(task_lifecycle);
+        if resume_pending_work && reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "targeted task cancellation and join must remain serialized with task publication"
+    )]
     pub(crate) async fn abort_turn_if_active(
         self: &Arc<Self>,
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> bool {
+        let task_lifecycle = self.task_lifecycle_lock.lock().await;
         let active_turn = {
             let mut active = self.active_turn.lock().await;
             if active
@@ -578,6 +635,7 @@ impl Session {
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue.clear_pending(&active_turn).await;
 
+        drop(task_lifecycle);
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -904,10 +962,6 @@ impl Session {
         turn_state: &Mutex<TurnState>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
-            return;
-        }
-
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
         task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
@@ -936,6 +990,17 @@ impl Session {
         }
 
         task.handle.abort();
+        match task.handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                warn!(
+                    sub_id,
+                    %error,
+                    "aborted task ended abnormally before shutdown cleanup"
+                );
+            }
+        }
 
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
