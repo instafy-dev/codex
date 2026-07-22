@@ -1,5 +1,7 @@
 use super::AuthRequestTelemetryContext;
 use super::CompactConversationRequestSettings;
+use super::INSTAFY_REQUIRED_TOOL_COMMAND_ONCE;
+use super::INSTAFY_REQUIRED_TOOL_METADATA_KEY;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
@@ -108,6 +110,146 @@ fn test_model_client_with_thread_id(
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
+}
+
+#[test]
+fn instafy_required_tool_contract_is_consumed_once_per_turn() {
+    let client = test_model_client(SessionSource::Cli);
+    let client_session = client.new_session();
+    let mut responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ Some("turn-required-tool"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+
+    assert!(!client_session.should_require_first_tool_call(&responses_metadata));
+    responses_metadata.extra.insert(
+        INSTAFY_REQUIRED_TOOL_METADATA_KEY.to_string(),
+        INSTAFY_REQUIRED_TOOL_COMMAND_ONCE.to_string(),
+    );
+    assert!(client_session.should_require_first_tool_call(&responses_metadata));
+
+    client_session
+        .required_tool_call_consumed
+        .store(true, Ordering::Release);
+    assert!(!client_session.should_require_first_tool_call(&responses_metadata));
+}
+
+#[tokio::test]
+async fn instafy_required_tool_waits_for_qualifying_execution_event() -> anyhow::Result<()> {
+    let client = test_model_client(SessionSource::Cli);
+    let client_session = client.new_session();
+    let mut responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ Some("turn-required-execution-tool"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    responses_metadata.extra.insert(
+        INSTAFY_REQUIRED_TOOL_METADATA_KEY.to_string(),
+        INSTAFY_REQUIRED_TOOL_COMMAND_ONCE.to_string(),
+    );
+
+    // Merely returning a provider stream must not consume the contract. A websocket request may
+    // still fail before its first valid response event and be retried by the caller.
+    let (unaccepted_stream, _) = super::map_response_events(
+        /*upstream_request_id*/ None,
+        futures::stream::pending(),
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Some(Arc::clone(&client_session.required_tool_call_consumed)),
+    );
+    assert!(client_session.should_require_first_tool_call(&responses_metadata));
+    drop(unaccepted_stream);
+
+    let helper_items = [
+        ResponseItem::ToolSearchCall {
+            id: None,
+            call_id: Some("search-call".to_string()),
+            status: Some("completed".to_string()),
+            execution: "client".to_string(),
+            arguments: json!({"query": "browser snapshot"}),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "list_mcp_resources".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "resource-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "plan-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "status".to_string(),
+            namespace: Some("mcp__instafy_personal_browser".to_string()),
+            arguments: "{}".to_string(),
+            call_id: "browser-status-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let helper_item_count = helper_items.len();
+    let helper_stream = futures::stream::iter(
+        helper_items
+            .into_iter()
+            .map(|item| Ok(ResponseEvent::OutputItemDone(item))),
+    )
+    .chain(futures::stream::pending());
+    let (mut helper_stream, _) = super::map_response_events(
+        /*upstream_request_id*/ None,
+        helper_stream,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Some(Arc::clone(&client_session.required_tool_call_consumed)),
+    );
+    for _ in 0..helper_item_count {
+        assert!(matches!(
+            helper_stream.next().await,
+            Some(Ok(ResponseEvent::OutputItemDone(_)))
+        ));
+    }
+    assert!(client_session.should_require_first_tool_call(&responses_metadata));
+    drop(helper_stream);
+
+    let execution_item = ResponseItem::FunctionCall {
+        id: None,
+        name: "snapshot".to_string(),
+        namespace: Some("mcp__instafy_personal_browser".to_string()),
+        arguments: "{}".to_string(),
+        call_id: "browser-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let execution_stream =
+        futures::stream::iter([Ok(ResponseEvent::OutputItemDone(execution_item))])
+            .chain(futures::stream::pending());
+    let (mut execution_stream, _) = super::map_response_events(
+        /*upstream_request_id*/ None,
+        execution_stream,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Some(Arc::clone(&client_session.required_tool_call_consumed)),
+    );
+    assert!(matches!(
+        execution_stream.next().await,
+        Some(Ok(ResponseEvent::OutputItemDone(_)))
+    ));
+    assert!(!client_session.should_require_first_tool_call(&responses_metadata));
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -588,6 +730,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*required_tool_call_consumed*/ None,
     );
 
     let observed = stream
@@ -638,6 +781,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        /*required_tool_call_consumed*/ None,
     );
 
     while stream.next().await.is_some() {}
@@ -713,6 +857,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*required_tool_call_consumed*/ None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output

@@ -158,6 +158,11 @@ const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
 const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+// Instafy browser and command turns use turn metadata to require one execution-tool action.
+// Keep this turn-scoped so retries and helper-only responses remain required, while the
+// continuation after a qualifying execution call returns to normal automatic tool selection.
+const INSTAFY_REQUIRED_TOOL_METADATA_KEY: &str = "codex.required_tool";
+const INSTAFY_REQUIRED_TOOL_COMMAND_ONCE: &str = "command_once";
 // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
@@ -272,6 +277,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    required_tool_call_consumed: Arc<AtomicBool>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -478,6 +484,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            required_tool_call_consumed: Arc::new(AtomicBool::new(false)),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1102,6 +1109,14 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    fn should_require_first_tool_call(&self, responses_metadata: &CodexResponsesMetadata) -> bool {
+        !self.required_tool_call_consumed.load(Ordering::Acquire)
+            && responses_metadata
+                .extra
+                .get(INSTAFY_REQUIRED_TOOL_METADATA_KEY)
+                .is_some_and(|value| value == INSTAFY_REQUIRED_TOOL_COMMAND_ONCE)
+    }
+
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
     }
@@ -1387,6 +1402,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
+        require_tool_call: bool,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
@@ -1428,6 +1444,9 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            if require_tool_call {
+                request.tool_choice = "required".to_string();
+            }
             self.client
                 .prepare_response_items_for_request(&mut request.input);
             let request_session_telemetry =
@@ -1450,6 +1469,7 @@ impl ModelClientSession {
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
+                        require_tool_call.then(|| Arc::clone(&self.required_tool_call_consumed)),
                     );
                     return Ok(stream);
                 }
@@ -1516,6 +1536,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        require_tool_call: bool,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
 
@@ -1540,6 +1561,9 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
+            if require_tool_call && !warmup {
+                request.tool_choice = "required".to_string();
+            }
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -1673,6 +1697,8 @@ impl ModelClientSession {
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
+                (require_tool_call && !warmup)
+                    .then(|| Arc::clone(&self.required_tool_call_consumed)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -1745,6 +1771,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                /*require_tool_call*/ false,
             )
             .await
         {
@@ -1787,6 +1814,8 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        let require_tool_call =
+            self.should_require_first_tool_call(responses_metadata) && !prompt.tools.is_empty();
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -1804,6 +1833,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            require_tool_call,
                         )
                         .await?
                     {
@@ -1823,6 +1853,7 @@ impl ModelClientSession {
                     service_tier,
                     responses_metadata,
                     inference_trace,
+                    require_tool_call,
                 ))
                 .await
             }
@@ -1906,6 +1937,7 @@ fn map_response_stream(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    required_tool_call_consumed: Option<Arc<AtomicBool>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -1921,7 +1953,74 @@ fn map_response_stream(
         session_telemetry,
         inference_trace_attempt,
         provider,
+        required_tool_call_consumed,
     )
+}
+
+fn is_instafy_required_execution_tool(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::LocalShellCall { .. } => true,
+        ResponseItem::FunctionCall {
+            name, namespace, ..
+        }
+        | ResponseItem::CustomToolCall {
+            name, namespace, ..
+        } => {
+            is_instafy_browser_execution_tool(namespace.as_deref(), name)
+                || namespace.as_deref().is_some_and(|namespace| {
+                    namespace.starts_with("mcp__") && !is_instafy_browser_namespace(namespace)
+                })
+                || (name.starts_with("mcp__") && !is_instafy_browser_flat_tool_name(name))
+                || (namespace.is_none()
+                    && matches!(
+                        name.as_str(),
+                        "apply_patch" | "exec_command" | "shell" | "shell_command" | "write_stdin"
+                    ))
+        }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Message { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => false,
+    }
+}
+
+fn is_instafy_browser_execution_tool(namespace: Option<&str>, name: &str) -> bool {
+    const BROWSER_EXECUTION_TOOL_NAMES: [&str; 6] =
+        ["snapshot", "navigate", "click", "type", "press", "scroll"];
+
+    if namespace.is_some_and(is_instafy_browser_namespace) {
+        return BROWSER_EXECUTION_TOOL_NAMES.contains(&name);
+    }
+
+    [
+        "mcp__instafy_personal_browser__",
+        "mcp__instafy_shared_browser__",
+    ]
+    .into_iter()
+    .find_map(|prefix| name.strip_prefix(prefix))
+    .is_some_and(|name| BROWSER_EXECUTION_TOOL_NAMES.contains(&name))
+}
+
+fn is_instafy_browser_namespace(namespace: &str) -> bool {
+    matches!(
+        namespace,
+        "mcp__instafy_personal_browser" | "mcp__instafy_shared_browser"
+    )
+}
+
+fn is_instafy_browser_flat_tool_name(name: &str) -> bool {
+    name.starts_with("mcp__instafy_personal_browser__")
+        || name.starts_with("mcp__instafy_shared_browser__")
 }
 
 fn map_response_events<S>(
@@ -1930,6 +2029,7 @@ fn map_response_events<S>(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    required_tool_call_consumed: Option<Arc<AtomicBool>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1970,6 +2070,12 @@ where
             };
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
+                    if is_instafy_required_execution_tool(&item)
+                        && let Some(required_tool_call_consumed) =
+                            required_tool_call_consumed.as_ref()
+                    {
+                        required_tool_call_consumed.store(true, Ordering::Release);
+                    }
                     items_added.push(item.clone());
                     if tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(item)))

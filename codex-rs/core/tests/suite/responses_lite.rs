@@ -132,6 +132,53 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_honors_required_tool_choice_with_additional_tools() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_model_info_override("gpt-5.6-sol", |model_info| {
+        model_info.use_responses_lite = true;
+    });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Use one tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: Some(HashMap::from([(
+                "codex.required_tool".to_string(),
+                "command_once".to_string(),
+            )])),
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let body = response_mock.single_request().body_json();
+    assert_eq!(body["tool_choice"], "required");
+    assert!(body.get("tools").is_none());
+    assert!(!additional_tools(&body)?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_lite_prepares_images() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
