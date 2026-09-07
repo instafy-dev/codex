@@ -147,6 +147,49 @@ async fn loopback_same_origin_redirect_is_followed_directly_with_bearer() {
 }
 
 #[tokio::test]
+async fn loopback_stop_redirects_returns_the_original_response() {
+    let target = MockServer::start().await;
+    Mock::given(path("/start"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/must-not-be-reached"))
+        .expect(1)
+        .mount(&target)
+        .await;
+    Mock::given(path("/must-not-be-reached"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target)
+        .await;
+
+    let response = client()
+        .http_request(request(
+            format!("{}/start", target.uri()),
+            HttpRedirectPolicy::Stop,
+        ))
+        .await
+        .expect("stop policy returns the redirect without following it");
+    assert_eq!(response.status, 302);
+}
+
+#[tokio::test]
+async fn loopback_same_origin_redirects_stop_after_ten_hops() {
+    let target = MockServer::start().await;
+    Mock::given(path("/loop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
+        .expect(11)
+        .mount(&target)
+        .await;
+
+    client()
+        .http_request(request(
+            format!("{}/loop", target.uri()),
+            HttpRedirectPolicy::Follow,
+        ))
+        .await
+        .expect_err("a same-origin redirect loop must terminate");
+    assert_eq!(target.received_requests().await.unwrap().len(), 11);
+}
+
+#[tokio::test]
 async fn non_loopback_request_keeps_using_the_configured_proxy() {
     let proxy = MockServer::start().await;
     let url = format!(

@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient as SharedHttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
 use codex_http_client::RouteAwareRequestError;
-use codex_http_client::build_reqwest_client_with_custom_ca;
-use codex_http_client::with_chatgpt_cloudflare_cookie_store;
 use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 use codex_protocol::shell_environment::OPENAI_FEDERATION_RULE_ID_ENV_VAR;
 use codex_protocol::shell_environment::OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR;
@@ -67,8 +67,9 @@ const HTTP_HEADER_ENV_DENYLIST: &[&str] = &[
 pub struct RouteAwareHttpClient {
     follow_redirects: RouteAwareClientPool,
     stop_redirects: RouteAwareClientPool,
-    loopback_follow_redirects: Arc<OnceLock<Result<reqwest::Client, String>>>,
-    loopback_stop_redirects: Arc<OnceLock<Result<reqwest::Client, String>>>,
+    loopback_client_builder: HttpClientBuilder,
+    loopback_follow_redirects: Arc<OnceLock<Result<SharedHttpClient, String>>>,
+    loopback_stop_redirects: Arc<OnceLock<Result<SharedHttpClient, String>>>,
 }
 
 /// Streaming response state held between the initial HTTP response and
@@ -82,13 +83,16 @@ pub(crate) struct PendingRouteAwareHttpBodyStream {
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct RouteAwareHttpRequestRunner {
     client: RouteAwareClientPool,
-    loopback_client: Arc<OnceLock<Result<reqwest::Client, String>>>,
-    redirect_policy: HttpRedirectPolicy,
+    loopback_client: Arc<OnceLock<Result<SharedHttpClient, String>>>,
+    loopback_client_builder: HttpClientBuilder,
 }
 
 impl RouteAwareHttpClient {
     pub fn new(http_client_factory: HttpClientFactory) -> Self {
         Self {
+            loopback_client_builder: HttpClientBuilder::new()
+                .with_chatgpt_cookies(&http_client_factory)
+                .without_request_logging(),
             loopback_follow_redirects: Arc::new(OnceLock::new()),
             loopback_stop_redirects: Arc::new(OnceLock::new()),
             follow_redirects: RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
@@ -124,10 +128,17 @@ impl RouteAwareHttpClient {
             HttpRedirectPolicy::Follow => Arc::clone(&self.loopback_follow_redirects),
             HttpRedirectPolicy::Stop => Arc::clone(&self.loopback_stop_redirects),
         };
+        let loopback_client_builder = match redirect_policy {
+            HttpRedirectPolicy::Follow => self
+                .loopback_client_builder
+                .clone()
+                .with_same_origin_redirects(),
+            HttpRedirectPolicy::Stop => self.loopback_client_builder.clone().without_redirects(),
+        };
         RouteAwareHttpRequestRunner {
             client,
             loopback_client,
-            redirect_policy,
+            loopback_client_builder,
         }
     }
 }
@@ -213,14 +224,10 @@ impl RouteAwareHttpRequestRunner {
                 // Local MCP bearer credentials must not reach ambient or system proxies.
                 // Keep redirects on this same origin so this direct route cannot escape.
                 let client = self.loopback_client.get_or_init(|| {
-                    let redirects = match self.redirect_policy {
-                        HttpRedirectPolicy::Follow => loopback_same_origin_redirect_policy(),
-                        HttpRedirectPolicy::Stop => reqwest::redirect::Policy::none(),
-                    };
-                    build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
-                        reqwest::Client::builder().no_proxy().redirect(redirects),
-                    ))
-                    .map_err(|error| error.to_string())
+                    self.loopback_client_builder
+                        .clone()
+                        .build_direct()
+                        .map_err(|error| error.to_string())
                 });
                 let client = client
                     .as_ref()
@@ -421,22 +428,6 @@ fn url_is_loopback(url: &Url) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-fn loopback_same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > 10 {
-            return attempt.error("too many redirects");
-        }
-        let Some(original_url) = attempt.previous().first() else {
-            return attempt.error("redirect is missing its original URL");
-        };
-        if original_url.origin() == attempt.url().origin() {
-            attempt.follow()
-        } else {
-            attempt.error("loopback http/request redirect changed origin")
-        }
-    })
 }
 
 fn log_send_error(method: &Method, error: RouteAwareRequestError) {

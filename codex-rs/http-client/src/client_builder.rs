@@ -30,7 +30,7 @@ use crate::with_chatgpt_cloudflare_cookie_store;
 #[derive(Clone)]
 pub struct HttpClientBuilder {
     default_headers: Option<HeaderMap>,
-    follow_redirects: bool,
+    redirect_policy: RedirectPolicy,
     connect_timeout: Option<Duration>,
     chatgpt_cloudflare_cookie_store: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
@@ -43,6 +43,14 @@ enum TlsBackend {
     #[default]
     TransportDefault,
     Rustls,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RedirectPolicy {
+    #[default]
+    Follow,
+    SameOrigin,
+    Stop,
 }
 
 impl HttpClientFactory {
@@ -87,12 +95,21 @@ impl HttpClientBuilder {
     }
 
     pub fn without_redirects(mut self) -> Self {
-        self.follow_redirects = false;
+        self.redirect_policy = RedirectPolicy::Stop;
+        self
+    }
+
+    /// Follows at most ten redirects while requiring the original scheme, host and port.
+    ///
+    /// This keeps exceptional direct clients, such as local capability transports, from
+    /// following a redirect onto a different origin using the same proxy bypass.
+    pub fn with_same_origin_redirects(mut self) -> Self {
+        self.redirect_policy = RedirectPolicy::SameOrigin;
         self
     }
 
     pub(crate) fn follows_redirects(&self) -> bool {
-        self.follow_redirects
+        self.redirect_policy != RedirectPolicy::Stop
     }
 
     pub(crate) fn with_rustls_tls(mut self) -> Self {
@@ -282,9 +299,25 @@ impl HttpClientBuilder {
         if let Some(default_headers) = self.default_headers {
             builder = builder.default_headers(default_headers);
         }
-        if !self.follow_redirects {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
+        builder = match self.redirect_policy {
+            RedirectPolicy::Follow => builder,
+            RedirectPolicy::SameOrigin => {
+                builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() > 10 {
+                        return attempt.error("too many redirects");
+                    }
+                    let Some(original_url) = attempt.previous().first() else {
+                        return attempt.error("redirect is missing its original URL");
+                    };
+                    if original_url.origin() == attempt.url().origin() {
+                        attempt.follow()
+                    } else {
+                        attempt.error("HTTP redirect changed origin")
+                    }
+                }))
+            }
+            RedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
+        };
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
         }
@@ -302,7 +335,7 @@ impl Default for HttpClientBuilder {
     fn default() -> Self {
         Self {
             default_headers: None,
-            follow_redirects: true,
+            redirect_policy: RedirectPolicy::Follow,
             connect_timeout: None,
             chatgpt_cloudflare_cookie_store: false,
             chatgpt_cookie_store: None,
