@@ -431,7 +431,9 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) -> anyhow::Res
             failures.push(format!("MCP runtime: {error:#}"));
         }
     }
-    sess.guardian_review_session.shutdown().await;
+    if let Err(error) = sess.guardian_review_session.shutdown().await {
+        failures.push(format!("guardian reviews: {error:#}"));
+    }
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
     if sess.active_turn.lock().await.is_some() {

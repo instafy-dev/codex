@@ -9,7 +9,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 
-async fn test_review_session() -> (
+pub(super) async fn test_review_session() -> (
     GuardianReviewSession,
     async_channel::Sender<Event>,
     async_channel::Receiver<Submission>,
@@ -33,6 +33,7 @@ async fn test_review_session() -> (
                 agent_status,
                 session_loop_termination: crate::session::completed_session_loop_termination(),
             },
+            shutdown_result: tokio::sync::OnceCell::new(),
             cancel_token: CancellationToken::new(),
             reuse_key,
             review_lock: Semaphore::new(/*permits*/ 1),
@@ -155,7 +156,7 @@ async fn spawned_guardian_session_preserves_windows_sandbox_proxy_settings() {
         mode,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve
     );
-    manager.shutdown().await;
+    manager.shutdown().await.expect("guardian cleanup");
 }
 
 #[tokio::test]

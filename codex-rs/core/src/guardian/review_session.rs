@@ -1,3 +1,7 @@
+#[path = "review_session_lifecycle.rs"]
+mod lifecycle;
+
+use lifecycle::GuardianSessionLifecycle;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -130,6 +134,7 @@ pub(crate) struct GuardianReviewSessionParams {
 pub(crate) struct GuardianReviewSessionManager {
     state: Arc<Mutex<GuardianReviewSessionState>>,
     cancellation_token: CancellationToken,
+    lifecycle: GuardianSessionLifecycle,
 }
 
 #[derive(Default)]
@@ -141,6 +146,7 @@ struct GuardianReviewSessionState {
 struct GuardianReviewSession {
     session: Arc<Session>,
     io: SessionIo,
+    shutdown_result: tokio::sync::OnceCell<Result<(), String>>,
     cancel_token: CancellationToken,
     reuse_key: GuardianReviewSessionReuseKey,
     review_lock: Semaphore,
@@ -358,15 +364,26 @@ pub(crate) fn prompt_cache_key_override_for_review_session(
 }
 
 impl GuardianReviewSession {
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancel_token.cancel();
-        let _ = self.io.shutdown_and_wait().await;
+        self.shutdown_result
+            .get_or_init(|| async {
+                self.io
+                    .shutdown_and_wait()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .clone()
+            .map_err(anyhow::Error::msg)
     }
 
     fn shutdown_in_background(self: &Arc<Self>) {
         let review_session = Arc::clone(self);
         drop(tokio::spawn(async move {
-            review_session.shutdown().await;
+            if let Err(error) = review_session.shutdown().await {
+                warn!(%error, "guardian cleanup failed");
+            }
         }));
     }
 
@@ -452,8 +469,10 @@ impl Drop for EphemeralReviewCleanup {
                     .position(|active_review| Arc::ptr_eq(active_review, &review_session))
                     .map(|index| state.ephemeral_reviews.swap_remove(index))
             };
-            if let Some(review_session) = review_session {
-                review_session.shutdown().await;
+            if let Some(review_session) = review_session
+                && let Err(error) = review_session.shutdown().await
+            {
+                warn!(%error, "guardian cleanup failed");
             }
         }));
     }
@@ -504,22 +523,26 @@ impl GuardianReviewSessionManager {
             reuse_key.root_authorization_version = root_authorization_version;
             let spawn_cancel_token = self.cancellation_token.child_token();
             let spawn_cancel_guard = spawn_cancel_token.clone().drop_guard();
-            let review_session = spawn_guardian_review_session(
-                &parent_session,
-                &parent_context,
-                spawn_config,
-                reuse_key,
-                spawn_cancel_token.clone(),
-                parent_compaction,
-                /*fork_snapshot*/ None,
-            )
-            .await?;
+            let review_session = self
+                .lifecycle
+                .spawn(spawn_guardian_review_session(
+                    &parent_session,
+                    &parent_context,
+                    spawn_config,
+                    reuse_key,
+                    spawn_cancel_token.clone(),
+                    parent_compaction,
+                    /*fork_snapshot*/ None,
+                ))
+                .await?;
             // A first review or shutdown may win while eager initialization is in flight;
             // install only if neither has happened.
             let mut state = self.state.lock().await;
             if !spawn_cancel_token.is_cancelled() && state.trunk.is_none() {
-                state.trunk = Some(Arc::new(review_session));
+                state.trunk = Some(review_session);
                 drop(spawn_cancel_guard.disarm());
+            } else {
+                review_session.shutdown_in_background();
             }
             Ok(())
         })
@@ -540,9 +563,11 @@ impl GuardianReviewSessionManager {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancellation_token.cancel();
-        self.invalidate().await;
+        self.lifecycle
+            .shutdown(GUARDIAN_INTERRUPT_DRAIN_TIMEOUT)
+            .await
     }
 
     pub(crate) async fn invalidate(&self) {
@@ -555,7 +580,9 @@ impl GuardianReviewSessionManager {
         };
         for review_session in review_session.into_iter().chain(ephemeral_reviews) {
             if self.cancellation_token.is_cancelled() {
-                review_session.shutdown().await;
+                if let Err(error) = review_session.shutdown().await {
+                    warn!(%error, "guardian cleanup failed");
+                }
             } else {
                 review_session.cancel_token.cancel();
                 review_session.shutdown_in_background();
@@ -648,7 +675,7 @@ impl GuardianReviewSessionManager {
                         deadline,
                         params.external_cancel.as_ref(),
                         &spawn_cancel_token,
-                        Box::pin(spawn_guardian_review_session(
+                        Box::pin(self.lifecycle.spawn(spawn_guardian_review_session(
                             &params.parent_session,
                             &params.parent_context,
                             params.spawn_config.clone(),
@@ -656,11 +683,11 @@ impl GuardianReviewSessionManager {
                             spawn_cancel_token.clone(),
                             parent_compaction.clone(),
                             /*fork_snapshot*/ None,
-                        )),
+                        ))),
                     )
                     .await
                     {
-                        Ok(Ok(review_session)) => Arc::new(review_session),
+                        Ok(Ok(review_session)) => review_session,
                         Ok(Err(err)) => {
                             return (
                                 GuardianReviewSessionOutcome::PromptBuildFailed(err),
@@ -751,10 +778,11 @@ impl GuardianReviewSessionManager {
             session.user_instructions().await,
             session.clone_history().await.history_version(),
         );
-        self.state.lock().await.trunk = Some(Arc::new(GuardianReviewSession {
+        self.state.lock().await.trunk = Some(self.lifecycle.register(GuardianReviewSession {
             reuse_key,
             session,
             io,
+            shutdown_result: tokio::sync::OnceCell::new(),
             cancel_token: CancellationToken::new(),
             review_lock: Semaphore::new(/*permits*/ 1),
             state: Mutex::new(GuardianReviewState {
@@ -778,10 +806,11 @@ impl GuardianReviewSessionManager {
             .lock()
             .await
             .ephemeral_reviews
-            .push(Arc::new(GuardianReviewSession {
+            .push(self.lifecycle.register(GuardianReviewSession {
                 reuse_key,
                 session,
                 io,
+                shutdown_result: tokio::sync::OnceCell::new(),
                 cancel_token: CancellationToken::new(),
                 review_lock: Semaphore::new(/*permits*/ 1),
                 state: Mutex::new(GuardianReviewState {
@@ -868,7 +897,7 @@ impl GuardianReviewSessionManager {
             deadline,
             params.external_cancel.as_ref(),
             &spawn_cancel_token,
-            Box::pin(spawn_guardian_review_session(
+            Box::pin(self.lifecycle.spawn(spawn_guardian_review_session(
                 &params.parent_session,
                 &params.parent_context,
                 fork_config,
@@ -876,11 +905,11 @@ impl GuardianReviewSessionManager {
                 spawn_cancel_token.clone(),
                 parent_compaction,
                 fork_snapshot,
-            )),
+            ))),
         )
         .await
         {
-            Ok(Ok(review_session)) => Arc::new(review_session),
+            Ok(Ok(review_session)) => review_session,
             Ok(Err(err)) => {
                 return (
                     GuardianReviewSessionOutcome::PromptBuildFailed(err),
@@ -959,6 +988,7 @@ async fn spawn_guardian_review_session(
     Ok(GuardianReviewSession {
         session,
         io,
+        shutdown_result: tokio::sync::OnceCell::new(),
         cancel_token,
         reuse_key,
         review_lock: Semaphore::new(/*permits*/ 1),
