@@ -16,6 +16,7 @@ fn request(url: String, redirect_policy: HttpRedirectPolicy) -> HttpRequestParam
         headers: vec![HttpHeader {
             name: "Authorization".to_string(),
             value: "Bearer fixture-mcp-token".to_string(),
+            value_env_var: None,
         }],
         body: None,
         timeout_ms: Some(2_000),

@@ -6044,10 +6044,10 @@ async fn confirmed_dormant_shutdown_prevents_later_first_use_from_starting_trans
         _diagnostics_guard: LIVE_CONNECTIONS.track(),
     };
     connection.shutdown_confirmed().await?;
-    assert_matches!(
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), connection.client()).await?,
         Err(StartupOutcomeError::Cancelled)
-    );
+    ));
     assert!(!*receiver.borrow());
     assert!(!polled.load(Ordering::Acquire));
     Ok(())
