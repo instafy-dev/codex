@@ -5994,11 +5994,7 @@ async fn confirmed_replacement_preserves_reused_connections_and_closes_removed_c
         vec![create_test_tool("docs", "search")],
     )
     .await;
-    let client = previous.servers["docs"]
-        .connection
-        .client
-        .ready_transport()
-        .expect("ready fixture transport");
+    let client = previous.servers["docs"].connection.client().await?.client;
     let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
     assert!(previous.shares_test_connection_with(&reconciled, "docs"));
 
