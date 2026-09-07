@@ -9682,7 +9682,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             &refresh_config,
             /*elicitation_reviewer*/ None,
         )
-        .await;
+        .await?;
 
     let next_step = session
         .capture_step_context(Arc::clone(&step_context.turn), &CancellationToken::new())
