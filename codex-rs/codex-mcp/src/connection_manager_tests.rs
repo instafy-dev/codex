@@ -5982,3 +5982,36 @@ async fn view_only_changes_reuse_connection_and_preserve_the_old_step() {
     );
     assert_eq!(new_call.tool_approval_mode(), AppToolApproval::Approve);
 }
+
+#[tokio::test]
+async fn confirmed_replacement_preserves_reused_connections_and_closes_removed_connections()
+-> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let config = reusable_server_config("http://127.0.0.1:1");
+    let previous = manager_with_reusable_ready_server(
+        &config,
+        &runtime_context,
+        vec![create_test_tool("docs", "search")],
+    )
+    .await;
+    let client = previous.servers["docs"]
+        .connection
+        .client
+        .ready_transport()
+        .expect("ready fixture transport");
+    let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
+    assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+
+    previous
+        .shutdown_replaced_connections_confirmed(&reconciled)
+        .await?;
+    assert!(!client.is_closed().await);
+
+    reconciled
+        .shutdown_replaced_connections_confirmed(&McpConnectionSet::empty(
+            /*prefix_mcp_tool_names*/ true,
+        ))
+        .await?;
+    assert!(client.is_closed().await);
+    Ok(())
+}
