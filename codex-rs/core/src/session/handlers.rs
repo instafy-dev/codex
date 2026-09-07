@@ -458,8 +458,8 @@ pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
-pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    let shutdown_result = shutdown_session_runtime(sess).await;
+pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> anyhow::Result<()> {
+    let mut shutdown_result = shutdown_session_runtime(sess).await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -480,6 +480,12 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         && let Err(e) = live_thread.shutdown().await
     {
         warn!("failed to shutdown thread persistence: {e}");
+        shutdown_result = Err(match shutdown_result {
+            Ok(()) => anyhow::anyhow!("thread persistence shutdown failed: {e}"),
+            Err(cleanup_error) => {
+                anyhow::anyhow!("{cleanup_error:#}; thread persistence shutdown failed: {e}")
+            }
+        });
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
@@ -508,7 +514,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         sess.services
             .rollout_thread_trace
             .record_ended(codex_rollout_trace::RolloutStatus::Failed);
-        return true;
+        return Err(error);
     }
 
     let event = Event {
@@ -522,7 +528,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     sess.services
         .rollout_thread_trace
         .record_ended(codex_rollout_trace::RolloutStatus::Completed);
-    true
+    Ok(())
 }
 
 pub async fn review(
@@ -566,9 +572,10 @@ pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
-) {
+) -> anyhow::Result<()> {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
+    let mut shutdown_result = Ok(());
     while let Ok(sub) = rx_sub.recv().await {
         if matches!(sub.op, Op::ResolveElicitation { .. }) {
             debug!(submission_id = %sub.id, operation = sub.op.kind(), "Submission");
@@ -743,7 +750,10 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+                Op::Shutdown => {
+                    shutdown_result = shutdown(&sess, sub.id.clone()).await;
+                    true
+                }
                 Op::Review { review_request } => {
                     review(&sess, &config, sub.id.clone(), review_request).await;
                     false
@@ -765,7 +775,8 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        if let Err(error) = shutdown_session_runtime(&sess).await {
+        shutdown_result = shutdown_session_runtime(&sess).await;
+        if let Err(error) = &shutdown_result {
             warn!(%error, "Codex session teardown after channel close was not confirmed");
         }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
@@ -773,9 +784,16 @@ pub(super) async fn submission_loop(
             && let Err(err) = live_thread.shutdown().await
         {
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
+            shutdown_result = Err(match shutdown_result {
+                Ok(()) => anyhow::anyhow!("thread persistence shutdown failed: {err}"),
+                Err(cleanup_error) => {
+                    anyhow::anyhow!("{cleanup_error:#}; thread persistence shutdown failed: {err}")
+                }
+            });
         }
     }
     debug!("Agent loop exited");
+    shutdown_result
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {

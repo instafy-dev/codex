@@ -878,6 +878,7 @@ impl McpConnectionSet {
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+    #[cfg(test)]
     pub async fn shutdown(&self) {
         if let Err(error) = self.shutdown_confirmed().await {
             warn!("MCP shutdown was not fully confirmed: {error:#}");

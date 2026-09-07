@@ -399,7 +399,9 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+// Cloneable cleanup result lets concurrent shutdown callers observe the same outcome
+// without competing with normal consumers of the protocol event stream.
+pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, Result<(), String>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitEnrichmentPolicy {
@@ -843,7 +845,7 @@ impl Session {
         let session_loop_handle = tokio::spawn(async move {
             submission_loop(session_for_loop, configured_config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+                .await
         });
         let io = SessionIo {
             tx_sub,
@@ -953,8 +955,7 @@ impl SessionIo {
             Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        session_loop_termination.await;
-        Ok(())
+        session_loop_termination.await.map_err(CodexErr::Fatal)
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -1018,14 +1019,21 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    futures::future::ready(Ok(())).boxed().shared()
 }
 
 pub(crate) fn session_loop_termination_from_handle(
-    handle: JoinHandle<()>,
+    handle: JoinHandle<anyhow::Result<()>>,
 ) -> SessionLoopTermination {
     async move {
-        let _ = handle.await;
+        match handle.await {
+            Ok(result) => {
+                result.map_err(|error| format!("Codex shutdown cleanup failed: {error:#}"))
+            }
+            Err(error) => Err(format!(
+                "Codex session loop ended without confirmed cleanup: {error}"
+            )),
+        }
     }
     .boxed()
     .shared()
@@ -4748,6 +4756,9 @@ async fn build_hooks_config(
 #[cfg(test)]
 #[path = "elicitation_holders_tests.rs"]
 mod elicitation_holders_tests;
+
+#[cfg(test)]
+mod shutdown_result_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -8269,7 +8269,9 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     session.async_hook_results = result_receiver;
     let session = Arc::new(session);
 
-    assert!(handlers::shutdown(&session, "sub-1".to_string()).await);
+    handlers::shutdown(&session, "sub-1".to_string())
+        .await
+        .expect("confirmed shutdown");
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
@@ -8368,7 +8370,9 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
-    submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+    submission_loop(session, Arc::clone(&turn_context.config), rx_sub)
+        .await
+        .expect("channel-close teardown");
 
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
@@ -8453,7 +8457,9 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
-    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub)
+        .await
+        .expect("channel-close teardown");
 
     assert_eq!(
         vec!["turn_abort", "thread_stop"],
@@ -8472,6 +8478,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
         let shutdown = rx_sub.recv().await.expect("shutdown submission");
         assert!(matches!(shutdown.op, Op::Shutdown));
         tokio::time::sleep(StdDuration::from_millis(50)).await;
+        Ok(())
     });
     let io = Arc::new(SessionIo {
         tx_sub,
@@ -8508,6 +8515,7 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
     let (shutdown_complete_tx, shutdown_complete_rx) = tokio::sync::oneshot::channel();
     let session_loop_handle = tokio::spawn(async move {
         let _ = shutdown_complete_rx.await;
+        Ok(())
     });
     let io = Arc::new(SessionIo {
         tx_sub,
@@ -8543,7 +8551,7 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,
@@ -8565,6 +8573,7 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
         child_shutdown_tx
             .send(())
             .expect("child shutdown signal should be delivered");
+        Ok(())
     });
     let child_session = Arc::new(child_session);
     let child_io = SessionIo {
@@ -8597,7 +8606,7 @@ async fn cached_guardian_subagent_exposes_its_rollout_path() {
     let child_rollout_path = attach_thread_persistence(&mut child_session).await;
     let (child_tx_sub, _child_rx_sub) = async_channel::bounded(4);
     let (_child_tx_event, child_rx_event) = async_channel::unbounded();
-    let child_session_loop_handle = tokio::spawn(async {});
+    let child_session_loop_handle = tokio::spawn(async { Ok(()) });
     let child_session = Arc::new(child_session);
     let child_io = SessionIo {
         tx_sub: child_tx_sub,
@@ -8628,7 +8637,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,
@@ -8650,6 +8659,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
         child_shutdown_tx
             .send(())
             .expect("child shutdown signal should be delivered");
+        Ok(())
     });
     let child_session = Arc::new(child_session);
     let child_io = SessionIo {

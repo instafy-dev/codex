@@ -735,9 +735,13 @@ async fn code_mode_session_provider_is_shared_across_threads() {
             completed,
             submit_failed: Vec::new(),
             timed_out: Vec::new(),
+            admission_failed: false,
         }
     );
 }
+
+#[path = "thread_manager_shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[tokio::test]
 async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {

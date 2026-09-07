@@ -213,6 +213,14 @@ pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
     pub submit_failed: Vec<ThreadId>,
     pub timed_out: Vec<ThreadId>,
+    /// Startup did not drain in time, or a partially constructed session lost its owner.
+    pub admission_failed: bool,
+}
+
+impl ThreadShutdownReport {
+    pub fn is_complete(&self) -> bool {
+        !self.admission_failed && self.submit_failed.is_empty() && self.timed_out.is_empty()
+    }
 }
 
 enum ShutdownOutcome {
@@ -344,6 +352,9 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    thread_admission: RwLock<()>,
+    shutdown_started: AtomicBool,
+    unconfirmed_startup: AtomicBool,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
@@ -367,6 +378,20 @@ pub(crate) struct ThreadManagerState {
     analytics_events_client: Option<AnalyticsEventsClient>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
+}
+
+struct ThreadSpawnAdmission<'a> {
+    _guard: tokio::sync::RwLockReadGuard<'a, ()>,
+    unconfirmed_startup: &'a AtomicBool,
+    cleanup_required: bool,
+}
+
+impl Drop for ThreadSpawnAdmission<'_> {
+    fn drop(&mut self) {
+        if self.cleanup_required {
+            self.unconfirmed_startup.store(true, Ordering::Release);
+        }
+    }
 }
 
 pub fn build_models_manager(
@@ -480,6 +505,9 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_admission: RwLock::new(()),
+                shutdown_started: AtomicBool::new(false),
+                unconfirmed_startup: AtomicBool::new(false),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
@@ -628,6 +656,9 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_admission: RwLock::new(()),
+                shutdown_started: AtomicBool::new(false),
+                unconfirmed_startup: AtomicBool::new(false),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -1201,54 +1232,78 @@ impl ThreadManager {
         }
     }
 
-    /// Tries to shut down all tracked threads concurrently within the provided timeout.
-    /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
-    /// remain tracked so callers can retry or inspect them later.
+    /// Permanently closes thread admission and shuts down tracked threads within one deadline.
+    /// Incomplete shutdowns remain tracked so callers can retry or inspect them later.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
-        let threads = {
-            let threads = self.state.threads.read().await;
-            threads
-                .iter()
-                .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
-                .collect::<Vec<_>>()
-        };
+        self.state.shutdown_started.store(true, Ordering::Release);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let initial_threads = self.state.threads.read().await.clone();
+        // Stop existing parents while waiting for in-flight child startup. The admission
+        // writer proves that every admitted startup either registered or left a failure.
+        let (admission, mut report) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.state.thread_admission.write()),
+            self.shutdown_threads_until(initial_threads.clone(), deadline),
+        );
+        let additional_threads = self
+            .state
+            .threads
+            .read()
+            .await
+            .iter()
+            .filter(|(thread_id, thread)| {
+                !initial_threads
+                    .get(*thread_id)
+                    .is_some_and(|initial| Arc::ptr_eq(initial, thread))
+            })
+            .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
+            .collect();
+        let additional = self
+            .shutdown_threads_until(additional_threads, deadline)
+            .await;
+        report.completed.extend(additional.completed);
+        report.submit_failed.extend(additional.submit_failed);
+        report.timed_out.extend(additional.timed_out);
+        report.admission_failed =
+            admission.is_err() || self.state.unconfirmed_startup.load(Ordering::Acquire);
+        for thread_ids in [
+            &mut report.completed,
+            &mut report.submit_failed,
+            &mut report.timed_out,
+        ] {
+            thread_ids.sort_by_key(std::string::ToString::to_string);
+            thread_ids.dedup();
+        }
+        report
+    }
 
+    async fn shutdown_threads_until(
+        &self,
+        threads: HashMap<ThreadId, Arc<CodexThread>>,
+        deadline: tokio::time::Instant,
+    ) -> ThreadShutdownReport {
         let mut shutdowns = threads
             .into_iter()
             .map(|(thread_id, thread)| async move {
-                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
-                {
-                    Ok(Ok(())) => ShutdownOutcome::Complete,
-                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
-                    Err(_) => ShutdownOutcome::TimedOut,
-                };
-                (thread_id, outcome)
+                let outcome =
+                    match tokio::time::timeout_at(deadline, thread.shutdown_and_wait()).await {
+                        Ok(Ok(())) => ShutdownOutcome::Complete,
+                        Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                        Err(_) => ShutdownOutcome::TimedOut,
+                    };
+                (thread_id, thread, outcome)
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
-
-        while let Some((thread_id, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
             match outcome {
-                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::Complete => {
+                    self.remove_thread_if_matches(&thread_id, &thread).await;
+                    report.completed.push(thread_id);
+                }
                 ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
             }
         }
-
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
-        }
-
-        report
-            .completed
-            .sort_by_key(std::string::ToString::to_string);
-        report
-            .submit_failed
-            .sort_by_key(std::string::ToString::to_string);
-        report
-            .timed_out
-            .sort_by_key(std::string::ToString::to_string);
         report
     }
 
@@ -1868,8 +1923,28 @@ impl ThreadManagerState {
             .unwrap_or_default()
     }
 
+    async fn admit_thread_spawn(&self) -> CodexResult<ThreadSpawnAdmission<'_>> {
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(CodexErr::InvalidRequest(
+                "thread manager is shutting down".to_string(),
+            ));
+        }
+        let guard = self.thread_admission.read().await;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(CodexErr::InvalidRequest(
+                "thread manager is shutting down".to_string(),
+            ));
+        }
+        Ok(ThreadSpawnAdmission {
+            _guard: guard,
+            unconfirmed_startup: &self.unconfirmed_startup,
+            cleanup_required: false,
+        })
+    }
+
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let mut admission = self.admit_thread_spawn().await?;
         let ThreadSpawnRequest {
             options,
             auth_manager,
@@ -1995,6 +2070,9 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
+        // A canceled or failed constructor may have started external resources before
+        // it can return an owned session. Never report a clean manager in that case.
+        admission.cleanup_required = true;
         let (session, io) = Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
@@ -2050,7 +2128,7 @@ impl ThreadManagerState {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
         let new_thread = self
-            .finalize_thread_spawn(session, io, tracked_session_source)
+            .finalize_thread_spawn(session, io, tracked_session_source, &mut admission)
             .await?;
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
@@ -2067,6 +2145,7 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
+        admission: &mut ThreadSpawnAdmission<'_>,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2091,6 +2170,7 @@ impl ThreadManagerState {
                     session_source,
                 ));
                 e.insert(thread.clone());
+                admission.cleanup_required = false;
                 return Ok(NewThread {
                     thread_id,
                     thread,
@@ -2099,8 +2179,9 @@ impl ThreadManagerState {
             }
         }
 
-        if let Err(err) = io.shutdown_and_wait().await {
-            warn!("failed to shut down duplicate thread {thread_id}: {err}");
+        match io.shutdown_and_wait().await {
+            Ok(()) => admission.cleanup_required = false,
+            Err(err) => warn!("failed to shut down duplicate thread {thread_id}: {err}"),
         }
         Err(CodexErr::InvalidRequest(format!(
             "thread {thread_id} is already running"

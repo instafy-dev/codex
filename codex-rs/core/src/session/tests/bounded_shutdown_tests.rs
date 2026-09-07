@@ -185,7 +185,10 @@ async fn shutdown_does_not_restart_pending_trigger_work_before_shutdown_complete
     .await
     .expect("shutdown should reach ShutdownComplete");
 
-    assert!(shutdown_task.await.expect("shutdown task should join"));
+    shutdown_task
+        .await
+        .expect("shutdown task should join")
+        .expect("shutdown cleanup should succeed");
     assert!(future_dropped.load(std::sync::atomic::Ordering::SeqCst));
     assert!(
         session.input_queue.has_trigger_turn_mailbox_items().await,
@@ -249,5 +252,8 @@ async fn shutdown_waits_for_a_concurrent_guardian_abort_to_join_the_turn() {
     .expect("shutdown should reach ShutdownComplete");
 
     assert!(guardian_abort.await.expect("guardian abort should join"));
-    assert!(shutdown_task.await.expect("shutdown task should join"));
+    shutdown_task
+        .await
+        .expect("shutdown task should join")
+        .expect("shutdown cleanup should succeed");
 }

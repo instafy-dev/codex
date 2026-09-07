@@ -233,13 +233,15 @@ impl CodexThread {
         &self.session.services.thread_extension_data
     }
 
+    /// Stop the session and return its confirmed resource and persistence cleanup result.
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
         self.io.shutdown_and_wait().await
     }
 
-    /// Wait until the underlying session loop has terminated.
+    /// Wait until the underlying session loop has terminated, regardless of cleanup outcome.
+    /// Use `shutdown_and_wait` when successful cleanup must be confirmed.
     pub async fn wait_until_terminated(&self) {
-        self.io.session_loop_termination.clone().await;
+        let _ = self.io.session_loop_termination.clone().await;
     }
 
     pub(crate) async fn emit_thread_ready_lifecycle(&self) {
@@ -425,7 +427,11 @@ impl CodexThread {
             .await
             .map_err(|_| CodexErr::Fatal("thread suspension reply was lost".to_string()))??;
         if matches!(&outcome, SuspendTurnOutcome::Suspended { .. }) {
-            self.io.session_loop_termination.clone().await;
+            self.io
+                .session_loop_termination
+                .clone()
+                .await
+                .map_err(CodexErr::Fatal)?;
         }
         Ok(outcome)
     }

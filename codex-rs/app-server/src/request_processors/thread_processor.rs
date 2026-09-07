@@ -1278,10 +1278,13 @@ impl ThreadRequestProcessor {
             .shutdown_all_threads_bounded(Duration::from_secs(10))
             .await;
         for thread_id in report.submit_failed {
-            warn!("failed to submit Shutdown to thread {thread_id}");
+            warn!("failed to confirm shutdown of thread {thread_id}");
         }
         for thread_id in report.timed_out {
             warn!("timed out waiting for thread {thread_id} to shut down");
+        }
+        if report.admission_failed {
+            warn!("thread startup did not finish with confirmed ownership before shutdown");
         }
     }
 

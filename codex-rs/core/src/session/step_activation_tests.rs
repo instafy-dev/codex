@@ -492,7 +492,10 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
     assert_eq!(before.settings.model_info.slug, MODEL_A);
     assert_eq!(turn.model_info().slug, MODEL_A);
     drop(submissions);
-    loop_task.await.expect("submission loop teardown");
+    loop_task
+        .await
+        .expect("submission loop join")
+        .expect("submission loop teardown");
 }
 
 #[derive(Clone, Copy)]
