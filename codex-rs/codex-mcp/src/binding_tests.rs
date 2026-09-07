@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use codex_config::AppToolApproval;
 use codex_config::Constrained;
+use codex_config::types::ApprovalsReviewer;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -21,11 +22,11 @@ use tokio::sync::Notify;
 use super::McpBinding;
 use super::PreparedMcpCall;
 use crate::binding_clients::McpBindingClients;
+use crate::client_tool_catalog::ClientToolCatalog;
 use crate::connection_manager::McpConnectionSet;
 use crate::rmcp_client::ManagedClient;
 use crate::server::McpServerMetadata;
 use crate::server::McpServerOrigin;
-use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 
 const SERVER_NAME: &str = "docs";
@@ -46,7 +47,7 @@ impl InProcessTransportFactory for TestInProcessTransportFactory {
 struct TestStep {
     step: Arc<McpBinding>,
     client: Arc<RmcpClient>,
-    tool_catalog_revision: Arc<tokio::sync::RwLock<u64>>,
+    tool_catalog: Arc<ClientToolCatalog>,
 }
 
 async fn test_step(
@@ -76,7 +77,9 @@ async fn test_step(
             .await
             .expect("create in-process MCP client"),
     );
+    let tool_catalog = Arc::new(ClientToolCatalog::new(vec![tool.clone()]));
     let managed_client = Arc::new(ManagedClient {
+        _auth_change_notifications: None,
         client: Arc::clone(&client),
         server_info: McpServerInfo {
             name: label.to_string(),
@@ -86,8 +89,7 @@ async fn test_step(
             icons: None,
             website_url: None,
         },
-        tools: vec![tool.clone()],
-        tool_filter: ToolFilter::default(),
+        tool_catalog: Arc::clone(&tool_catalog),
         tool_timeout: None,
         server_instructions: None,
         server_supports_sandbox_state_meta_capability: supports_sandbox_state_meta,
@@ -97,17 +99,23 @@ async fn test_step(
         SERVER_NAME.to_string(),
         Arc::clone(&managed_client),
     )])));
-    let connections = Arc::new(McpConnectionSet::new_uninitialized_with_permission_profile(
-        &Constrained::allow_any(AskForApproval::OnRequest),
-        &PermissionProfile::default(),
-        /*prefix_mcp_tool_names*/ true,
-    ));
-    let tool_catalog_revision = Arc::new(tokio::sync::RwLock::new(0));
+    let connections = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
+    let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());
+    if label == "old" {
+        config.approval_policy = Constrained::allow_any(AskForApproval::Never);
+        config.permission_profile = PermissionProfile::Disabled;
+    } else {
+        config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    }
+    config
+        .server_permission_profiles
+        .insert(SERVER_NAME.to_string(), config.permission_profile.clone());
+    let config = Arc::new(config);
     let prepared = PreparedMcpCall::new(
         Arc::clone(&connections),
         managed_client,
+        Arc::clone(&config),
         /*catalog_revision*/ 0,
-        Arc::clone(&tool_catalog_revision),
         tool.clone(),
         McpServerMetadata {
             environment_id: format!("{label}-environment"),
@@ -121,20 +129,21 @@ async fn test_step(
         },
         Some(format!("{label}-plugin")),
         label == "old",
-    );
+    )
+    .expect("test call should retain its thread-owned permission profile");
     let calls = HashMap::from([((SERVER_NAME.to_string(), TOOL_NAME.to_string()), prepared)]);
 
     TestStep {
         step: Arc::new(McpBinding::new(
             connections,
             clients,
-            Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir())),
+            config,
             /*plugins_available*/ false,
             vec![tool],
             calls,
         )),
         client,
-        tool_catalog_revision,
+        tool_catalog,
     }
 }
 
@@ -206,6 +215,25 @@ async fn prepared_call_keeps_captured_connection_and_authority_after_refresh() -
     );
     assert!(Arc::ptr_eq(&old_call.client.client, &old.client));
     assert!(!Arc::ptr_eq(&old.client, &new.client));
+    assert_eq!(
+        (
+            old_call.config().approval_policy.value(),
+            old_call.permission_profile(),
+            old_call.config().approvals_reviewer,
+        ),
+        (
+            AskForApproval::Never,
+            &PermissionProfile::Disabled,
+            ApprovalsReviewer::User,
+        )
+    );
+    assert_eq!(
+        (
+            new_call.config().approval_policy.value(),
+            new_call.config().approvals_reviewer,
+        ),
+        (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview)
+    );
 
     drop(old.step);
     assert!(
@@ -246,6 +274,7 @@ async fn prepared_call_does_not_reroute_after_captured_connection_closes() {
         .call(
             Some(serde_json::json!({"query": "codex"})),
             /*meta*/ None,
+            /*timeout*/ None,
         )
         .await
         .expect_err("a call bound to a closed connection must fail");
@@ -268,12 +297,19 @@ async fn prepared_call_is_rejected_after_catalog_refresh() {
         .prepare_call(SERVER_NAME, TOOL_NAME)
         .expect("step should prepare the advertised tool");
 
-    *step.tool_catalog_revision.write().await += 1;
+    step.tool_catalog
+        .refresh(
+            || async { Ok((step.step.tools().to_vec(), ())) },
+            |_, ()| {},
+        )
+        .await
+        .expect("refresh tool catalog");
 
     let error = prepared
         .call(
             Some(serde_json::json!({"query": "codex"})),
             /*meta*/ None,
+            /*timeout*/ None,
         )
         .await
         .expect_err("a call from an older catalog must be rejected");
@@ -295,12 +331,18 @@ async fn stale_prepared_call_does_not_run_preparation() {
         .step
         .prepare_call(SERVER_NAME, TOOL_NAME)
         .expect("step should prepare the advertised tool");
-    *step.tool_catalog_revision.write().await += 1;
+    step.tool_catalog
+        .refresh(
+            || async { Ok((step.step.tools().to_vec(), ())) },
+            |_, ()| {},
+        )
+        .await
+        .expect("refresh tool catalog");
     let prepared_side_effect_ran = Arc::new(AtomicBool::new(false));
     let marker = Arc::clone(&prepared_side_effect_ran);
 
     prepared
-        .call_with_preparation(|| async move {
+        .call_with_preparation(/*requested_timeout*/ None, || async move {
             marker.store(true, Ordering::SeqCst);
             Ok((None, None))
         })
@@ -328,7 +370,7 @@ async fn preparation_holds_catalog_authority_until_it_finishes() {
     let finish = Arc::clone(&finish_preparation);
     let call = tokio::spawn(async move {
         prepared
-            .call_with_preparation(|| async move {
+            .call_with_preparation(/*requested_timeout*/ None, || async move {
                 started.notify_one();
                 finish.notified().await;
                 Err(anyhow::anyhow!("stop after preparation"))
@@ -337,13 +379,20 @@ async fn preparation_holds_catalog_authority_until_it_finishes() {
     });
 
     preparation_started.notified().await;
+    let refresh = step.tool_catalog.refresh(
+        || async { Ok((step.step.tools().to_vec(), ())) },
+        |_, ()| {},
+    );
+    tokio::pin!(refresh);
     assert!(
-        step.tool_catalog_revision.try_write().is_err(),
+        futures::poll!(&mut refresh).is_pending(),
         "catalog replacement must wait for irreversible call preparation"
     );
     finish_preparation.notify_one();
     call.await
         .expect("call task should finish")
         .expect_err("the test preparation should stop the call");
-    assert!(step.tool_catalog_revision.try_write().is_ok());
+    refresh
+        .await
+        .expect("catalog refresh should finish after preparation");
 }

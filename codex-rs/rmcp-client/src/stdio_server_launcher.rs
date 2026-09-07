@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -25,9 +26,9 @@ use std::sync::atomic::Ordering;
 use std::thread::sleep;
 #[cfg(unix)]
 use std::thread::spawn;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 use anyhow::Result;
@@ -40,29 +41,34 @@ use codex_exec_server::ExecProcess;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use codex_utils_pty::process_group::kill_process_group;
+#[cfg(target_os = "macos")]
+use codex_utils_pty::process_group::kill_process_group_with_member_fallback as kill_process_group;
 #[cfg(unix)]
 use codex_utils_pty::process_group::process_group_exists;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use codex_utils_pty::process_group::terminate_process_group;
+#[cfg(target_os = "macos")]
+use codex_utils_pty::process_group::terminate_process_group_with_member_fallback as terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
-use rmcp::transport::child_process::TokioChildProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::time::sleep as async_sleep;
 use tracing::info;
 use tracing::warn;
 
 use crate::executor_process_transport::ExecutorProcessTransport;
+use crate::local_stdio_transport::LocalStdioTransport;
 use crate::program_resolver;
+use crate::protocol_mode::McpProtocolMode;
 use crate::utils::create_env_for_mcp_server;
 use crate::utils::create_env_overlay_for_remote_mcp_server;
 use crate::utils::remote_mcp_env_var_names;
@@ -91,6 +97,7 @@ pub struct StdioServerCommand {
     env: Option<HashMap<OsString, OsString>>,
     env_vars: Vec<McpServerEnvVar>,
     cwd: Option<String>,
+    protocol_mode: McpProtocolMode,
 }
 
 /// Client-side rmcp transport for a launched MCP stdio server.
@@ -104,7 +111,7 @@ pub struct StdioServerTransport {
 }
 
 enum StdioServerTransportInner {
-    Local(TokioChildProcess),
+    Local(LocalStdioTransport),
     Executor(ExecutorProcessTransport),
 }
 
@@ -160,6 +167,7 @@ impl StdioServerCommand {
         env: Option<HashMap<OsString, OsString>>,
         env_vars: Vec<McpServerEnvVar>,
         cwd: Option<String>,
+        protocol_mode: McpProtocolMode,
     ) -> Self {
         Self {
             program,
@@ -167,6 +175,7 @@ impl StdioServerCommand {
             env,
             env_vars,
             cwd,
+            protocol_mode,
         }
     }
 }
@@ -214,64 +223,10 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PROCESS_GROUP_KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-#[cfg(any(windows, test))]
-fn confirm_process_absent_after_failed_taskkill(
-    pid: u32,
-    taskkill_status: &str,
-    process_is_running: io::Result<bool>,
-) -> io::Result<()> {
-    match process_is_running {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(io::Error::other(format!(
-            "taskkill exited with status {taskkill_status}; MCP process tree rooted at PID {pid} is still running"
-        ))),
-        Err(error) => Err(io::Error::new(
-            error.kind(),
-            format!(
-                "taskkill exited with status {taskkill_status}; could not confirm that MCP process tree rooted at PID {pid} exited: {error}"
-            ),
-        )),
-    }
-}
-
-#[cfg(windows)]
-fn windows_process_is_running(pid: u32) -> io::Result<bool> {
-    // `taskkill` uses localized error text, so do not infer "not found" from
-    // its stderr. `tasklist`'s CSV fields keep the numeric PID machine-readable
-    // across locales. A successful query without that exact PID confirms that
-    // the process has already exited; query failures remain ambiguous.
-    let output = std::process::Command::new("tasklist")
-        .arg("/FI")
-        .arg(format!("PID eq {pid}"))
-        .arg("/FO")
-        .arg("CSV")
-        .arg("/NH")
-        .stdin(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "tasklist exited with status {}",
-            output.status
-        )));
-    }
-
-    // Redirected tasklist output can use the active Windows code page. Match
-    // only the ASCII CSV PID field so decoding localized text is unnecessary.
-    Ok(tasklist_csv_contains_pid(&output.stdout, pid))
-}
-
-#[cfg(any(windows, test))]
-fn tasklist_csv_contains_pid(output: &[u8], pid: u32) -> bool {
-    let pid_field = format!(",\"{pid}\",").into_bytes();
-    output
-        .windows(pid_field.len())
-        .any(|window| window == pid_field)
-}
 
 #[cfg(unix)]
 struct LocalProcessTerminator {
@@ -279,8 +234,9 @@ struct LocalProcessTerminator {
 }
 
 #[cfg(windows)]
-struct LocalProcessTerminator {
-    pid: u32,
+enum LocalProcessTerminator {
+    Job(codex_utils_pty::JobObject),
+    Process(OwnedHandle),
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -319,6 +275,7 @@ impl LocalStdioServerLauncher {
             env,
             env_vars,
             cwd,
+            protocol_mode,
         } = command;
         let program_name = program.to_string_lossy().into_owned();
         let envs = create_env_for_mcp_server(env, &env_vars).map_err(io::Error::other)?;
@@ -326,25 +283,85 @@ impl LocalStdioServerLauncher {
         let resolved_program =
             program_resolver::resolve(program, &envs, &cwd).map_err(io::Error::other)?;
 
-        let mut command = Command::new(resolved_program);
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .current_dir(cwd)
-            .env_clear()
-            .envs(envs)
-            .args(args);
-        #[cfg(unix)]
-        command.process_group(0);
+        let build_command = || {
+            let mut command = Command::new(&resolved_program);
+            command
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&envs)
+                .args(&args);
+            #[cfg(unix)]
+            command.process_group(0);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = build_command();
+        #[cfg(not(windows))]
+        let command = build_command();
+        #[cfg(windows)]
+        let job = match codex_utils_pty::JobObject::create_without_breakaway() {
+            Ok(job) => {
+                job.prepare_suspended_spawn(&mut command);
+                Some(job)
+            }
+            Err(error) => {
+                warn!("Windows MCP process job containment unavailable: {error}");
+                None
+            }
+        };
 
-        let (transport, stderr) = TokioChildProcess::builder(command)
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let process = StdioServerProcessHandle::local(
-            program_name.clone(),
-            transport.id().map(LocalProcessTerminator::new),
-        );
+        let spawn_transport = |command: Command| -> io::Result<(
+            StdioServerTransportInner,
+            Option<tokio::process::ChildStderr>,
+            Option<u32>,
+        )> {
+            let (transport, stderr) =
+                LocalStdioTransport::spawn(command, program_name.clone(), protocol_mode)?;
+            let process_id = transport.id();
+            Ok((
+                StdioServerTransportInner::Local(transport),
+                stderr,
+                process_id,
+            ))
+        };
+        let (transport, stderr, process_id) = spawn_transport(command)?;
+        #[cfg(windows)]
+        let (transport, stderr, process_id, job) = match job {
+            Some(job) => match process_id
+                .ok_or_else(|| io::Error::other("missing suspended MCP server process id"))
+                .and_then(|process_id| job.assign_and_resume_process(process_id))
+            {
+                Ok(true) => (transport, stderr, process_id, Some(job)),
+                Ok(false) => (transport, stderr, process_id, None),
+                Err(error) => {
+                    warn!(
+                        "Windows MCP process job containment failed; retrying without it: {error}"
+                    );
+                    drop(stderr);
+                    drop(transport);
+                    drop(job);
+                    let (transport, stderr, process_id) = spawn_transport(build_command())?;
+                    (transport, stderr, process_id, None)
+                }
+            },
+            None => (transport, stderr, process_id, None),
+        };
+        #[cfg(windows)]
+        let terminator = match job {
+            Some(job) => Some(LocalProcessTerminator::Job(job)),
+            None => process_id.and_then(|process_id| {
+                match codex_utils_pty::JobObject::open_process_handle(process_id) {
+                    Ok(handle) => Some(LocalProcessTerminator::Process(handle)),
+                    Err(error) => {
+                        warn!("Windows MCP process handle unavailable: {error}");
+                        None
+                    }
+                }
+            }),
+        };
+        #[cfg(not(windows))]
+        let terminator = process_id.map(LocalProcessTerminator::new);
+        let process = StdioServerProcessHandle::local(program_name.clone(), terminator);
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -365,23 +382,18 @@ impl LocalStdioServerLauncher {
         }
 
         Ok(StdioServerTransport {
-            inner: StdioServerTransportInner::Local(transport),
+            inner: transport,
             process,
         })
     }
 }
 
 impl LocalProcessTerminator {
+    #[cfg(not(windows))]
     fn new(process_group_id: u32) -> Self {
         #[cfg(unix)]
         {
             Self { process_group_id }
-        }
-        #[cfg(windows)]
-        {
-            Self {
-                pid: process_group_id,
-            }
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -412,15 +424,15 @@ impl LocalProcessTerminator {
 
     #[cfg(windows)]
     fn terminate_on_drop(&self) {
-        let _ = std::process::Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let result = match self {
+            Self::Job(job) => job.terminate(),
+            Self::Process(process_handle) => {
+                codex_utils_pty::JobObject::terminate_process_handle(process_handle)
+            }
+        };
+        if let Err(error) = result {
+            warn!("Failed to terminate Windows MCP process: {error}");
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -459,29 +471,32 @@ impl LocalProcessTerminator {
 
     #[cfg(windows)]
     async fn terminate_and_confirm(&self) -> io::Result<()> {
-        let status = std::process::Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
+        let Self::Job(job) = self else {
+            self.terminate_on_drop();
+            // An exact process handle cannot prove that uncontained descendants exited.
+            return Err(io::Error::other(
+                "Windows MCP process tree has no job containment; descendant exit cannot be confirmed",
+            ));
+        };
+        if !job.has_running_processes()? {
             return Ok(());
         }
-
-        // Shutdown is idempotent: the tracked process can exit between the
-        // transport closing and taskkill running. Accept a nonzero taskkill
-        // only when a separate process-table query confirms that PID is gone.
-        // A live PID or a failed query leaves the process tree's state
-        // uncertain and must remain an error.
-        confirm_process_absent_after_failed_taskkill(
-            self.pid,
-            &status.to_string(),
-            windows_process_is_running(self.pid),
-        )
+        if let Err(error) = job.terminate()
+            && job.has_running_processes()?
+        {
+            return Err(error);
+        }
+        let deadline = Instant::now() + PROCESS_GROUP_KILL_CONFIRM_TIMEOUT;
+        while Instant::now() < deadline {
+            if !job.has_running_processes()? {
+                return Ok(());
+            }
+            async_sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Windows MCP process tree remained after job termination",
+        ))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -520,7 +535,14 @@ impl StdioServerProcessHandle {
             StdioServerProcessKind::Local(Some(terminator)) => {
                 terminator.terminate_and_confirm().await
             }
-            StdioServerProcessKind::Local(None) => Ok(()),
+            StdioServerProcessKind::Local(None) => {
+                #[cfg(windows)]
+                return Err(io::Error::other(
+                    "Windows MCP process termination handle is unavailable",
+                ));
+                #[cfg(not(windows))]
+                Ok(())
+            }
             StdioServerProcessKind::Executor(process) => match process.terminate().await {
                 Ok(()) => Ok(()),
                 Err(error) => Err(io::Error::other(error)),
@@ -574,6 +596,11 @@ impl Drop for StdioServerProcessHandleInner {
 /// MCP framing still runs in the orchestrator. The executor only owns the
 /// child process and transports raw stdin/stdout/stderr bytes, so it does not
 /// need to know about MCP methods such as `initialize` or `tools/list`.
+///
+/// Windows executor-backed servers retain the executor's normal descendant
+/// lifetime. MCP-specific containment requires negotiated process ownership:
+/// caller-controlled process IDs cannot safely select a destructive policy,
+/// and a wrapper may exit while its descendants continue serving requests.
 #[derive(Clone)]
 pub struct ExecutorStdioServerLauncher {
     exec_backend: Arc<dyn ExecBackend>,
@@ -611,6 +638,7 @@ impl ExecutorStdioServerLauncher {
             env,
             env_vars,
             cwd,
+            protocol_mode: _,
         } = command;
         let Some(cwd) = cwd else {
             return Err(io::Error::other(
@@ -635,9 +663,11 @@ impl ExecutorStdioServerLauncher {
         // rmcp write JSON-RPC requests after the process starts.
         let started = exec_backend
             .start(ExecParams {
+                metadata: Default::default(),
                 process_id,
                 argv,
                 cwd,
+                shell_snapshot: None,
                 env_policy: Some(Self::remote_env_policy(&remote_env_vars)),
                 env,
                 tty: false,
@@ -728,56 +758,6 @@ mod tests {
     use codex_protocol::config_types::EnvironmentVariablePattern;
     use codex_protocol::config_types::ShellEnvironmentPolicy;
     use codex_protocol::shell_environment;
-
-    #[test]
-    fn failed_taskkill_is_idempotent_when_process_is_confirmed_absent() {
-        let result = confirm_process_absent_after_failed_taskkill(42, "exit code: 128", Ok(false));
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn failed_taskkill_remains_an_error_when_process_is_live() {
-        let error = confirm_process_absent_after_failed_taskkill(42, "exit code: 1", Ok(true))
-            .expect_err("a live process must not be treated as terminated");
-
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(error.to_string().contains("PID 42 is still running"));
-    }
-
-    #[test]
-    fn failed_taskkill_remains_an_error_when_process_state_is_ambiguous() {
-        let error = confirm_process_absent_after_failed_taskkill(
-            42,
-            "exit code: 1",
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "process table unavailable",
-            )),
-        )
-        .expect_err("an unsuccessful process query must remain an error");
-
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("could not confirm"));
-        assert!(error.to_string().contains("process table unavailable"));
-    }
-
-    #[test]
-    fn tasklist_csv_pid_probe_matches_only_the_exact_pid_field() {
-        let output = br#""mcp-server.exe","42","Console","1","1,024 K"
-"other.exe","420","Console","1","1,024 K""#;
-
-        assert!(tasklist_csv_contains_pid(output, 42));
-        assert!(tasklist_csv_contains_pid(output, 420));
-        assert!(!tasklist_csv_contains_pid(output, 4));
-    }
-
-    #[test]
-    fn tasklist_csv_pid_probe_treats_localized_no_match_text_as_absent() {
-        let localized_no_match = b"INFO: no matching process (localized text may vary)";
-
-        assert!(!tasklist_csv_contains_pid(localized_no_match, 42));
-    }
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

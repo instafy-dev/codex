@@ -66,6 +66,9 @@ fn normalized_summary_path(mut summary: ConversationSummary) -> Result<Conversat
     if !summary.path.as_os_str().is_empty() {
         summary.path = normalized_canonical_path(summary.path)?;
     }
+    if !summary.cwd.as_os_str().is_empty() {
+        summary.cwd = AbsolutePathBuf::from_absolute_path(summary.cwd)?.into_path_buf();
+    }
     Ok(summary)
 }
 
@@ -132,6 +135,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: Default::default(),
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {

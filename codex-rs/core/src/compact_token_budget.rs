@@ -16,6 +16,7 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
+use tokio_util::sync::CancellationToken;
 
 /// Runs token-budget manual compaction as a normal compaction lifecycle.
 ///
@@ -31,13 +32,15 @@ pub(crate) async fn run_manual_compact_task(
         trace_id: turn_context.trace_id.clone(),
         started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
         model_context_window: turn_context.model_context_window(),
-        collaboration_mode_kind: turn_context.mode,
+        collaboration_mode_kind: turn_context.mode(),
     });
     sess.send_event(&turn_context, start_event).await;
 
     // Manual compaction runs outside run_turn, so it captures its own current step.
-    let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
-    let world_state = Arc::new(sess.build_world_state_for_step(&step_context).await);
+    let step_context = sess
+        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .await?;
+    let world_state = Arc::new(sess.build_world_state_for_step(&step_context).await?);
     run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Manual).await
 }
 
@@ -54,7 +57,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     let world_state = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage { world_state, .. } => world_state,
         InitialContextInjection::DoNotInject => {
-            Arc::new(sess.build_world_state_for_step(&step_context).await)
+            Arc::new(sess.build_world_state_for_step(&step_context).await?)
         }
     };
     run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Auto).await

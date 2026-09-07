@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
@@ -8,18 +9,39 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_protocol::turn_input::CyberAccessProgram;
 use futures::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
 
 pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
 pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
+
+/// Explicit per-request access selection using the Responses API wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AccessPrograms {
+    cyber: &'static str,
+}
+
+impl From<CyberAccessProgram> for AccessPrograms {
+    fn from(program: CyberAccessProgram) -> Self {
+        Self {
+            cyber: match program {
+                CyberAccessProgram::Standard => "standard",
+                CyberAccessProgram::DaybreakBlue => "daybreak_blue",
+                CyberAccessProgram::DaybreakRed => "daybreak_red",
+            },
+        }
+    }
+}
 
 /// Canonical input payload for the compaction endpoint.
 #[derive(Debug, Clone, Serialize)]
@@ -29,7 +51,7 @@ pub struct CompactionInput<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     pub instructions: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Value>>,
+    pub tools: Option<ResponsesApiTools>,
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
@@ -39,6 +61,8 @@ pub struct CompactionInput<'a> {
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<AccessPrograms>,
 }
 
 /// Canonical input payload for the memory summarize endpoint.
@@ -70,9 +94,16 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
+/// The server response currently being handled, shared with tool-review extensions.
+#[derive(Clone, Debug)]
+pub struct ResponseId(pub String);
+
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        /// Existing server response ID, when supplied by the stream.
+        response_id: Option<String>,
+    },
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
@@ -90,6 +121,7 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        usage_metadata: Option<ResponseUsageMetadata>,
         /// Did the model affirmatively end its turn? Some providers do not set this,
         /// so we rely on fallback logic when this is `None`.
         end_turn: Option<bool>,
@@ -212,6 +244,40 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
     }
 }
 
+/// Serialized tool definitions for Responses API requests.
+///
+/// Keeping the tool list as raw JSON avoids rebuilding a generic JSON value
+/// tree, while the shared allocation keeps request clones cheap.
+#[derive(Debug, Clone)]
+pub struct ResponsesApiTools(Arc<RawValue>);
+
+impl ResponsesApiTools {
+    pub(crate) fn as_raw_value(&self) -> &RawValue {
+        &self.0
+    }
+}
+
+impl From<Arc<RawValue>> for ResponsesApiTools {
+    fn from(value: Arc<RawValue>) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialEq for ResponsesApiTools {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.get() == other.0.get()
+    }
+}
+
+impl Serialize for ResponsesApiTools {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
     pub model: String,
@@ -219,7 +285,7 @@ pub struct ResponsesApiRequest {
     pub instructions: String,
     pub input: Vec<ResponseItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub tools: Option<ResponsesApiTools>,
     pub tool_choice: String,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,
@@ -236,6 +302,8 @@ pub struct ResponsesApiRequest {
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<AccessPrograms>,
 }
 
 impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
@@ -245,7 +313,7 @@ impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
             instructions: &request.instructions,
             previous_response_id: None,
             input: &request.input,
-            tools: request.tools.as_deref(),
+            tools: request.tools.as_ref().map(ResponsesApiTools::as_raw_value),
             tool_choice: &request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
             reasoning: request.reasoning.as_ref(),
@@ -258,6 +326,7 @@ impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
             text: request.text.as_ref(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
+            access_programs: request.access_programs,
         }
     }
 }
@@ -271,7 +340,7 @@ pub struct ResponseCreateWsRequest<'a> {
     pub previous_response_id: Option<String>,
     pub input: &'a [ResponseItem],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<&'a [Value]>,
+    pub tools: Option<&'a RawValue>,
     pub tool_choice: &'a str,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<&'a Reasoning>,
@@ -290,6 +359,8 @@ pub struct ResponseCreateWsRequest<'a> {
     pub generate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<AccessPrograms>,
 }
 
 pub fn response_create_client_metadata(

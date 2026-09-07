@@ -68,10 +68,14 @@ use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginInstalledParams;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginReadParams;
+use codex_app_server_protocol::PluginSearchParams;
 use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::ProcessKillParams;
 use codex_app_server_protocol::ProcessSpawnParams;
+use codex_app_server_protocol::ProjectImportParams;
+use codex_app_server_protocol::ProjectListParams;
+use codex_app_server_protocol::ProjectReadParams;
 use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlPairingStartParams;
@@ -103,11 +107,13 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadSearchOccurrencesParams;
 use codex_app_server_protocol::ThreadSearchParams;
+use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTimelineListParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -130,6 +136,11 @@ use core_test_support::test_codex::test_env;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tokio::process::Command;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use crate::json_logging::JsonLogCapture;
 use crate::local_websocket_exec_server::LocalWebsocketExecServer;
@@ -150,13 +161,14 @@ pub struct TestAppServer {
     // Fields drop in declaration order. Tear down the delayed child before
     // removing an owned CODEX_HOME that may still be its cwd on Windows.
     _delayed_exec_server: Option<(LocalWebsocketExecServer, WebsocketDelayInterposer)>,
+    _attribution_settings_server: Option<MockServer>,
+    _owned_install_dir: Option<TempDir>,
     _owned_codex_home: Option<TempDir>,
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
 pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
-const CODE_MODE_HOST_PATH_ENV_VAR: &str = "CODEX_CODE_MODE_HOST_PATH";
 #[cfg(windows)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(not(windows))]
@@ -183,7 +195,15 @@ impl TestAppServer {
     /// Closes stdio and waits for app-server's graceful thread teardown to finish.
     pub async fn shutdown_gracefully(&mut self) -> std::io::Result<ExitStatus> {
         drop(self.stdin.take());
-        self.process.wait().await
+        // Drain final notifications so a full stdout pipe cannot block runtime shutdown.
+        let mut sink = tokio::io::sink();
+        tokio::select! {
+            status = self.process.wait() => status,
+            drained = tokio::io::copy(&mut self.stdout, &mut sink) => {
+                drained?;
+                self.process.wait().await
+            }
+        }
     }
 
     /// Returns the automatically selected test environment retained by this server.
@@ -249,10 +269,20 @@ impl TestAppServer {
             }
         }
 
-        let mut process = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .context("codex-mcp-server proc should start")?;
+        cmd.kill_on_drop(true);
+        let mut retries = 0;
+        let mut process = loop {
+            let process = cmd.spawn();
+            if !process
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ExecutableFileBusy)
+                || retries == 2
+            {
+                break process.context("codex app-server proc should start")?;
+            }
+            retries += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         let stdin = process
             .stdin
             .take()
@@ -285,6 +315,8 @@ impl TestAppServer {
             auto_env: None,
             json_logs,
             _delayed_exec_server: None,
+            _attribution_settings_server: None,
+            _owned_install_dir: None,
             _owned_codex_home: None,
         })
     }
@@ -453,6 +485,33 @@ impl TestAppServer {
         self.send_request("thread/start", params).await
     }
 
+    /// Send a `project/import` JSON-RPC request.
+    pub async fn send_project_import_request(
+        &mut self,
+        params: ProjectImportParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/import", params).await
+    }
+
+    /// Send a `project/list` JSON-RPC request.
+    pub async fn send_project_list_request(
+        &mut self,
+        params: ProjectListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/list", params).await
+    }
+
+    /// Send a project/read JSON-RPC request.
+    pub async fn send_project_read_request(
+        &mut self,
+        params: ProjectReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/read", params).await
+    }
+
     /// Sends a `thread/start` request selecting the builder's automatic
     /// environment. Returns an error if `params` already select environments
     /// so the caller cannot accidentally override the fixture.
@@ -529,6 +588,15 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/metadata/update", params).await
+    }
+
+    /// Send a `thread/section/move` JSON-RPC request.
+    pub async fn send_thread_section_move_request(
+        &mut self,
+        params: ThreadSectionMoveParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/section/move", params).await
     }
 
     /// Send a `thread/settings/update` JSON-RPC request.
@@ -890,6 +958,15 @@ impl TestAppServer {
         self.send_request("plugin/list", params).await
     }
 
+    /// Send a `plugin/search` JSON-RPC request.
+    pub async fn send_plugin_search_request(
+        &mut self,
+        params: PluginSearchParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("plugin/search", params).await
+    }
+
     /// Send a `plugin/installed` JSON-RPC request.
     pub async fn send_plugin_installed_request(
         &mut self,
@@ -1121,6 +1198,14 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/realtime/stop", params).await
+    }
+
+    pub async fn send_thread_timeline_list_request(
+        &mut self,
+        params: ThreadTimelineListParams,
+    ) -> anyhow::Result<i64> {
+        self.send_request("thread/timeline/list", Some(serde_json::to_value(params)?))
+            .await
     }
 
     pub async fn send_thread_realtime_list_voices_request(
@@ -1481,7 +1566,7 @@ impl TestAppServer {
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?
     }
 
-    async fn send_request(
+    pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -1879,6 +1964,35 @@ impl TestAppServerBuilder {
                 )
             }
         };
+        let attribution_settings_server = if codex_home.join("auth.json").is_file() {
+            let config_path = codex_home.join("config.toml");
+            let config = std::fs::read_to_string(&config_path)?;
+            if config
+                .lines()
+                .any(|line| line.trim_start().starts_with("chatgpt_base_url"))
+            {
+                None
+            } else {
+                let settings_server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/backend-api/wham/settings/user"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "commit_attribution_enabled": false,
+                    })))
+                    .mount(&settings_server)
+                    .await;
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "chatgpt_base_url = \"{}/backend-api\"\n{config}",
+                        settings_server.uri()
+                    ),
+                )?;
+                Some(settings_server)
+            }
+        } else {
+            None
+        };
         let (auto_env, delayed_exec_server) = match environment {
             TestAppServerEnvironment::Auto => {
                 let environments_toml = codex_home.join("environments.toml");
@@ -1951,25 +2065,47 @@ impl TestAppServerBuilder {
                 (None, None)
             }
         };
-        if !env_overrides
-            .iter()
-            .any(|(key, _)| key == CODE_MODE_HOST_PATH_ENV_VAR)
-            && let Ok(code_mode_host_program) =
-                codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
-        {
-            env_overrides.insert(
-                0,
-                (
-                    CODE_MODE_HOST_PATH_ENV_VAR.to_string(),
-                    Some(code_mode_host_program.to_string_lossy().into_owned()),
-                ),
-            );
-        }
-        let program = match program {
+        let custom_program = program.is_some();
+        let mut program = match program {
             Some(program) => program,
             None => codex_utils_cargo_bin::cargo_bin("codex-app-server")
                 .context("should find binary for codex-app-server")?,
         };
+        let mut owned_install_dir = None;
+        if !custom_program
+            && codex_utils_cargo_bin::runfiles_available()
+            && let Ok(code_mode_host_program) =
+                codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
+        {
+            // Bazel keeps binary targets in separate package directories.
+            // Recreate the installed sibling layout without a path override.
+            // Prefer Bazel's TEST_TMPDIR so staging can share a filesystem with
+            // the binaries and avoid expensive cross-filesystem copies.
+            let install_dir = match std::env::var_os("TEST_TMPDIR") {
+                Some(test_tmpdir) => TempDir::new_in(test_tmpdir)?,
+                None => TempDir::new()?,
+            };
+            let staged_program = install_dir.path().join(
+                program
+                    .file_name()
+                    .context("app-server executable should have a filename")?,
+            );
+            let staged_host = install_dir.path().join(
+                code_mode_host_program
+                    .file_name()
+                    .context("code-mode host executable should have a filename")?,
+            );
+            for (source, destination) in [
+                (&program, &staged_program),
+                (&code_mode_host_program, &staged_host),
+            ] {
+                std::fs::hard_link(source, destination)
+                    .or_else(|_| std::fs::copy(source, destination).map(|_| ()))
+                    .with_context(|| format!("stage executable {}", source.display()))?;
+            }
+            program = staged_program;
+            owned_install_dir = Some(install_dir);
+        }
         let env_overrides = env_overrides
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_deref()))
@@ -1983,8 +2119,10 @@ impl TestAppServerBuilder {
         )
         .await?;
         app_server.auto_env = auto_env;
+        app_server._owned_install_dir = owned_install_dir;
         app_server._owned_codex_home = owned_codex_home;
         app_server._delayed_exec_server = delayed_exec_server;
+        app_server._attribution_settings_server = attribution_settings_server;
         Ok(app_server)
     }
 }

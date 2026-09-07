@@ -3,17 +3,48 @@ use std::path::Path;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
 use super::RolloutLineageSegment;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_reference_lineage_escaping_symlinked_sessions_root() {
+    let home = TempDir::new().expect("temp dir");
+    let external = TempDir::new().expect("external temp dir");
+    let external_sessions = external.path().join("sessions");
+    fs::create_dir_all(external_sessions.as_path()).expect("create external sessions");
+    std::os::unix::fs::symlink(external_sessions.as_path(), home.path().join("sessions"))
+        .expect("symlink sessions");
+    let escaped = TempDir::new().expect("escaped temp dir");
+    let escaped_rollouts = escaped.path().join("rollouts");
+    fs::create_dir_all(escaped_rollouts.as_path()).expect("create escaped rollouts");
+    std::os::unix::fs::symlink(escaped_rollouts.as_path(), external_sessions.join("2026"))
+        .expect("symlink nested sessions directory");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    write_rollout(
+        home.path(),
+        thread_id,
+        /*history_base*/ None,
+        /*next_ordinal*/ 3,
+    );
+
+    let error = store
+        .resolve_rollout_lineage_for_reference(thread_id)
+        .await
+        .expect_err("escaping reference lineage should be rejected");
+
+    assert!(error.to_string().contains("must be in Codex home"));
+}
 
 #[tokio::test]
 async fn resolves_nested_lineage_with_empty_intermediate_segments() {
@@ -33,7 +64,7 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
     let middle_end = history_position(
         middle_path.as_path(),
         middle,
-        /*end_ordinal_exclusive*/ 1,
+        /*end_ordinal_exclusive*/ 5,
     );
     let child_path = write_rollout(
         home.path(),
@@ -51,18 +82,21 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
         lineage.segments,
         vec![
             RolloutLineageSegment {
-                thread_id: root,
+                rollout_id: root,
                 rollout_path: root_path.clone(),
+                start_ordinal: 1,
                 end: Some(root_end),
             },
             RolloutLineageSegment {
-                thread_id: middle,
+                rollout_id: middle,
                 rollout_path: middle_path.clone(),
+                start_ordinal: 5,
                 end: Some(middle_end),
             },
             RolloutLineageSegment {
-                thread_id: child,
+                rollout_id: child,
                 rollout_path: child_path,
+                start_ordinal: 6,
                 end: None,
             },
         ]
@@ -117,11 +151,14 @@ async fn resolves_lineage_at_explicit_history_position() {
     let end = history_position(
         child_path.as_path(),
         child,
-        /*end_ordinal_exclusive*/ 2,
+        /*end_ordinal_exclusive*/ 6,
     );
 
     let lineage = store
-        .resolve_rollout_lineage_at(end)
+        .resolve_rollout_lineage(child)
+        .await
+        .expect("resolve child lineage")
+        .truncate_at(end)
         .await
         .expect("resolve explicit position");
 
@@ -129,13 +166,15 @@ async fn resolves_lineage_at_explicit_history_position() {
         lineage.segments,
         vec![
             RolloutLineageSegment {
-                thread_id: root,
+                rollout_id: root,
                 rollout_path: root_path.clone(),
+                start_ordinal: 1,
                 end: Some(root_end),
             },
             RolloutLineageSegment {
-                thread_id: child,
+                rollout_id: child,
                 rollout_path: child_path.clone(),
+                start_ordinal: 5,
                 end: Some(end),
             },
         ]
@@ -235,8 +274,9 @@ fn write_rollout_under(
 ) -> std::path::PathBuf {
     fs::create_dir_all(directory.as_path()).expect("create rollout directory");
     let path = directory.join(format!("rollout-2026-07-16T00-00-00-{thread_id}.jsonl"));
+    let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
     let mut lines = vec![rollout_line(
-        /*ordinal*/ 0,
+        initial_ordinal,
         RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
@@ -248,7 +288,10 @@ fn write_rollout_under(
             git: None,
         }),
     )];
-    for ordinal in 1..next_ordinal {
+    for offset in 1..next_ordinal {
+        let ordinal = initial_ordinal
+            .checked_add(offset)
+            .expect("fixture ordinal");
         lines.push(rollout_line(
             ordinal,
             RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
@@ -280,11 +323,16 @@ fn history_position(
 }
 
 fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
-    let line_count = usize::try_from(end_ordinal_exclusive).expect("ordinal fits usize");
     let bytes = fs::read(path).expect("read rollout");
     let end_byte_offset = bytes
         .split_inclusive(|byte| *byte == b'\n')
-        .take(line_count)
+        .take_while(|line| {
+            codex_rollout::parse_rollout_line_bytes(line)
+                .expect("parse rollout fixture")
+                .ordinal
+                .expect("paginated rollout ordinal")
+                < end_ordinal_exclusive
+        })
         .map(<[u8]>::len)
         .sum::<usize>();
     u64::try_from(end_byte_offset).expect("rollout byte offset fits u64")

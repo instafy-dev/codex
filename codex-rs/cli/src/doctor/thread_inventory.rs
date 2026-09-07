@@ -4,9 +4,8 @@ use super::CheckStatus;
 use super::Config;
 use super::DoctorCheck;
 use super::DoctorIssue;
+use codex_history::RolloutItem;
 use codex_protocol::protocol::InternalSessionSource;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::ThreadStateAuditRow;
@@ -91,15 +90,9 @@ impl RolloutScan {
 }
 
 pub(super) async fn thread_inventory_check(config: &Config) -> DoctorCheck {
-    let sqlite = codex_state::SqliteConfig::from_sqlite_home(
-        codex_utils_absolute_path::AbsolutePathBuf::resolve_path_against_base(
-            &config.sqlite_home,
-            &config.codex_home,
-        ),
-    );
     thread_inventory_check_for_roots(
         config.codex_home.as_path(),
-        &sqlite,
+        config.sqlite_config(),
         config.model_provider_id.as_str(),
     )
     .await
@@ -142,7 +135,7 @@ async fn thread_inventory_check_for_roots(
         return missing_state_db_check(scan, details);
     }
 
-    let rows = match codex_state::read_thread_state_audit_rows(&state_db_path).await {
+    let rows = match codex_state::read_thread_state_audit_rows(sqlite).await {
         Ok(rows) => rows,
         Err(err) => {
             details.push(format!("rollout DB read error: {err}"));
@@ -549,7 +542,7 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
             Err(_) => continue,
         };
         if item_type == "session_meta" {
-            return match serde_json::from_str::<RolloutLine>(line.trim()) {
+            return match codex_rollout::parse_rollout_line(line.trim()) {
                 Ok(line) => match line.item {
                     RolloutItem::SessionMeta(session_meta) => {
                         RolloutThreadId::Id(session_meta.meta.id.to_string())
@@ -566,7 +559,7 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
             };
         }
         if !has_legacy_item {
-            has_legacy_item = serde_json::from_str::<RolloutLine>(line.trim()).is_ok();
+            has_legacy_item = codex_rollout::parse_rollout_line(line.trim()).is_ok();
         }
     }
 
@@ -680,6 +673,7 @@ fn source_category(source: &str) -> &'static str {
         SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => {
             "internal:memory_consolidation"
         }
+        SessionSource::Internal(InternalSessionSource::Guardian) => "internal:guardian",
         SessionSource::SubAgent(SubAgentSource::Review) => "subagent:review",
         SessionSource::SubAgent(SubAgentSource::Compact) => "subagent:compact",
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => "subagent:thread_spawn",
@@ -750,6 +744,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_history::RolloutLine;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
@@ -867,7 +862,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -986,7 +981,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&metadata_path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -1119,7 +1114,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -1153,7 +1148,7 @@ mod tests {
             fixture.write_rollout(/*archived*/ false, "2025-01-02T10-00-00", filename_id);
         let contents = std::fs::read_to_string(&path).expect("rollout file");
         let mut rollout_line =
-            serde_json::from_str::<RolloutLine>(contents.trim()).expect("rollout line");
+            codex_rollout::parse_rollout_line(contents.trim()).expect("rollout line");
         let RolloutItem::SessionMeta(session_meta) = &mut rollout_line.item else {
             panic!("expected session metadata");
         };
@@ -1310,7 +1305,7 @@ mod tests {
             let codex_home = TempDir::new().expect("codex home");
             let sqlite_home = TempDir::new().expect("sqlite home");
             let _runtime = codex_state::StateRuntime::init(
-                sqlite_home.path().to_path_buf(),
+                codex_state::SqliteConfig::new_for_testing(sqlite_home.path().abs()),
                 "test-provider".to_string(),
             )
             .await
@@ -1359,9 +1354,8 @@ mod tests {
 
         async fn insert_thread_row(&self, id: &str, rollout_path: &Path, archived: bool) {
             let sqlite = self.sqlite();
-            let state_db_path = sqlite.state_db_path();
             let pool = sqlite
-                .open_read_write_pool(&state_db_path)
+                .open_read_write_pool(&sqlite.state_db_path())
                 .await
                 .expect("sqlite pool");
             sqlx::query(

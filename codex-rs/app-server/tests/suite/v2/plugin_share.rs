@@ -95,6 +95,7 @@ async fn plugin_share_save_uploads_local_plugin() -> Result<()> {
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "plugin_id": "plugins_123",
             "share_url": "https://chatgpt.example/plugins/share/share-key-1",
+            "can_publish_to_workspace": true,
         })))
         .expect(1)
         .mount(&server)
@@ -123,6 +124,7 @@ async fn plugin_share_save_uploads_local_plugin() -> Result<()> {
         PluginShareSaveResponse {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: "https://chatgpt.example/plugins/share/share-key-1".to_string(),
+            can_publish_to_workspace: Some(true),
         }
     );
 
@@ -170,12 +172,15 @@ async fn plugin_share_save_uploads_local_plugin() -> Result<()> {
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,
                     installed: true,
+                    installed_at: None,
                     enabled: true,
                     install_policy: PluginInstallPolicy::Available,
                     install_policy_source: None,
                     must_show_installation_interstitial: Some(false),
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: codex_app_server_protocol::PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(expected_plugin_interface()),
                     keywords: Vec::new(),
                 },
@@ -278,6 +283,7 @@ async fn plugin_share_save_forwards_access_policy() -> Result<()> {
         PluginShareSaveResponse {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: "https://chatgpt.example/plugins/share/share-key-1".to_string(),
+            can_publish_to_workspace: None,
         }
     );
     Ok(())
@@ -586,12 +592,15 @@ async fn plugin_share_list_returns_created_workspace_plugins() -> Result<()> {
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,
                     installed: true,
+                    installed_at: None,
                     enabled: true,
                     install_policy: PluginInstallPolicy::Available,
                     install_policy_source: None,
                     must_show_installation_interstitial: Some(false),
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: codex_app_server_protocol::PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(expected_plugin_interface()),
                     keywords: Vec::new(),
                 },
@@ -1246,12 +1255,15 @@ async fn plugin_share_delete_removes_created_workspace_plugin() -> Result<()> {
                     share_context: Some(expected_share_context("plugins_123")),
                     source: PluginSource::Remote,
                     installed: true,
+                    installed_at: None,
                     enabled: true,
                     install_policy: PluginInstallPolicy::Available,
                     install_policy_source: None,
                     must_show_installation_interstitial: Some(false),
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: codex_app_server_protocol::PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(expected_plugin_interface()),
                     keywords: Vec::new(),
                 },
@@ -1361,6 +1373,7 @@ fn remote_plugin_json(plugin_id: &str) -> serde_json::Value {
         "name": "demo-plugin",
         "scope": "WORKSPACE",
         "discoverability": "PRIVATE",
+        "can_publish_to_workspace": true,
         "share_url": "https://chatgpt.example/plugins/share/share-key-1",
         "share_principals": [
             {
@@ -1454,6 +1467,7 @@ fn expected_share_context(plugin_id: &str) -> PluginShareContext {
                 name: "Reader".to_string(),
             },
         ]),
+        can_publish_to_workspace: Some(true),
     }
 }
 
