@@ -73,7 +73,8 @@ async fn failed_cleanup_is_reported_to_every_shutdown_waiter_without_consuming_e
             max_output_tokens: None,
         })
         .await
-        .expect_err("the inert fixture never executes code");
+        .err()
+        .expect("the inert fixture never executes code");
     let (tx_event, rx_event) = async_channel::unbounded();
     session.tx_event = tx_event;
     let (tx_sub, rx_sub) = async_channel::bounded::<Submission>(4);
@@ -136,7 +137,8 @@ async fn failed_cleanup_on_submission_channel_close_reaches_termination_waiter()
             max_output_tokens: None,
         })
         .await
-        .expect_err("the inert fixture never executes code");
+        .err()
+        .expect("the inert fixture never executes code");
     let (tx_sub, rx_sub) = async_channel::bounded::<Submission>(1);
     let loop_handle = tokio::spawn(submission_loop(Arc::new(session), turn.config, rx_sub));
     drop(tx_sub);
