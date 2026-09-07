@@ -143,8 +143,7 @@ impl PreparedTurnInputSettings {
         };
         let turn_context = match kind {
             TurnStartKind::User | TurnStartKind::Recovery => Some(
-                session
-                    .new_turn_with_sub_id(submission_id.clone(), updates, options)
+                Box::pin(session.new_turn_with_sub_id(submission_id.clone(), updates, options))
                     .await?,
             ),
             TurnStartKind::Automatic => {
@@ -201,7 +200,10 @@ pub(super) async fn handle(
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
     match mode {
-        TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
+        // Preserve the fork's bounded debug-worker stack across the new admission API.
+        TurnInputMode::StartOrSteer => {
+            Box::pin(start_or_steer(session, request, submission_id)).await
+        }
         TurnInputMode::StartIfIdle => {
             let kind = match &request.input {
                 SubmittedTurnInput::UserInput { content, .. } if !content.is_empty() => {
