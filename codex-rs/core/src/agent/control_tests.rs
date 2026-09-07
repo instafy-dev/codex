@@ -205,6 +205,19 @@ impl AgentControlHarness {
         }
     }
 
+    fn restart_manager_after_shutdown(&mut self) {
+        // Terminal shutdown fences admission permanently. A later runtime restores
+        // the same persisted threads through a fresh manager and control handle.
+        self.manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            self.config.model_provider.clone(),
+            self.config.codex_home.to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            self.state_db.clone(),
+        );
+        self.control = self.manager.agent_control();
+    }
+
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
@@ -4490,7 +4503,7 @@ async fn resume_closed_child_reopens_open_descendants() {
 
 #[tokio::test]
 async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdown() {
-    let harness = AgentControlHarness::new().await;
+    let mut harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4546,8 +4559,8 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
-    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
-    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+    assert!(report.is_complete());
+    harness.restart_manager_after_shutdown();
 
     let resumed_parent_thread_id = harness
         .control
@@ -4581,7 +4594,7 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
 
 #[tokio::test]
 async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_source_is_stale() {
-    let harness = AgentControlHarness::new().await;
+    let mut harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4659,8 +4672,8 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
-    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
-    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+    assert!(report.is_complete());
+    harness.restart_manager_after_shutdown();
 
     let resumed_parent_thread_id = harness
         .control
@@ -4712,7 +4725,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
 
 #[tokio::test]
 async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() {
-    let harness = AgentControlHarness::new().await;
+    let mut harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4771,8 +4784,8 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
-    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
-    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+    assert!(report.is_complete());
+    harness.restart_manager_after_shutdown();
     tokio::fs::remove_file(&child_rollout_path)
         .await
         .expect("child rollout path should be removable");
