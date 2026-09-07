@@ -128,7 +128,20 @@ impl McpServerConnection {
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
         if let Some(startup_trigger) = &self.startup_trigger {
-            startup_trigger.send_replace(true);
+            let mut cancelled = false;
+            startup_trigger.send_if_modified(|started| {
+                // Serialize first use with the dormant-client shutdown probe.
+                // A retired lazy connection must never start after confirmation.
+                cancelled = self.client.cancel_token.is_cancelled();
+                if cancelled || *started {
+                    return false;
+                }
+                *started = true;
+                true
+            });
+            if cancelled {
+                return Err(StartupOutcomeError::Cancelled);
+            }
         }
         self.client.client().await
     }
@@ -136,8 +149,15 @@ impl McpServerConnection {
     async fn shutdown_confirmed(&self) -> Result<()> {
         // A dormant lazy client has not launched a transport. Cancel it without
         // triggering startup merely to shut it down.
-        if self.startup_is_dormant() {
+        if self.startup_trigger.as_ref().is_some_and(|trigger| {
+            let started = trigger.borrow();
+            if *started {
+                return false;
+            }
+            // Keep the watch read guard until cancellation is visible to first use.
             self.client.cancel_token.cancel();
+            true
+        }) {
             return Ok(());
         }
         self.client.shutdown_confirmed().await

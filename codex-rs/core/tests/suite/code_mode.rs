@@ -6638,19 +6638,18 @@ text(result.output);
         "command_once".to_string(),
     )])));
     test.codex.start_or_steer_turn(turn_request.clone()).await?;
-    loop {
-        let event = test.codex.next_event().await?;
-        match event.msg {
-            EventMsg::Warning(warning) => assert!(
+    wait_for_event(&test.codex, |event| {
+        if let EventMsg::Warning(warning) = event {
+            assert!(
                 !warning.message.contains("Model metadata")
                     && !warning.message.contains("fallback metadata"),
                 "Astra should resolve bundled metadata: {}",
                 warning.message,
-            ),
-            EventMsg::TurnComplete(_) => break,
-            _ => {}
+            );
         }
-    }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     let first = helper_request.single_request().body_json();
     let second = execution_request.single_request().body_json();

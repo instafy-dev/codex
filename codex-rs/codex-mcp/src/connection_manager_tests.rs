@@ -6015,3 +6015,40 @@ async fn confirmed_replacement_preserves_reused_connections_and_closes_removed_c
     assert!(client.is_closed().await);
     Ok(())
 }
+
+#[tokio::test]
+async fn confirmed_dormant_shutdown_prevents_later_first_use_from_starting_transport()
+-> anyhow::Result<()> {
+    let (trigger, receiver) = watch::channel(false);
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_by_client = Arc::clone(&polled);
+    let connection = McpServerConnection {
+        identity: None,
+        client: AsyncManagedClient {
+            client: async move {
+                polled_by_client.store(true, Ordering::Release);
+                futures::future::pending().await
+            }
+            .boxed()
+            .shared(),
+            is_codex_apps_mcp_server: false,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            startup_reconnect: None,
+            cancel_token: CancellationToken::new(),
+        },
+        startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+        startup_trigger: Some(trigger),
+        _diagnostics_guard: LIVE_CONNECTIONS.track(),
+    };
+    connection.shutdown_confirmed().await?;
+    assert_matches!(
+        tokio::time::timeout(Duration::from_secs(1), connection.client()).await?,
+        Err(StartupOutcomeError::Cancelled)
+    );
+    assert!(!*receiver.borrow());
+    assert!(!polled.load(Ordering::Acquire));
+    Ok(())
+}
