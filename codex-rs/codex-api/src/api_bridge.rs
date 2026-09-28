@@ -14,6 +14,7 @@ use codex_protocol::error::UsageLimitReachedError;
 use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Duration;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
     match err {
@@ -114,6 +115,16 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         }
                     }
 
+                    // Instafy's model proxy does not retry an upstream rate limit itself. It
+                    // answers with a 429 whose body is marked retryable and leaves the retry to
+                    // this client. A stream error sends the turn through the stream retry budget
+                    // after the proxy's delay, instead of ending it on a RetryLimit that claims
+                    // retries were made when none were.
+                    if let Some(message) = instafy_retryable_error_message(&body_text) {
+                        let delay = instafy_retryable_429_delay(headers.as_ref(), Utc::now());
+                        return CodexErr::Stream(message, Some(delay));
+                    }
+
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
@@ -158,6 +169,15 @@ const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =
     "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
+const RETRY_AFTER_HEADER: &str = "retry-after";
+const INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE: &str =
+    "The AI provider is rate limiting requests (429 Too Many Requests).";
+// Instafy runtimes allow a single stream retry, so the wait should outlast a short
+// rate-limit window without spending much of the run's time budget. A missing or
+// unreadable Retry-After gets a few seconds rather than the sub-second backoff.
+const INSTAFY_RETRYABLE_429_DEFAULT_DELAY: Duration = Duration::from_secs(5);
+const INSTAFY_RETRYABLE_429_MIN_DELAY: Duration = Duration::from_secs(1);
+const INSTAFY_RETRYABLE_429_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -202,6 +222,52 @@ fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String> {
         .and_then(|error| error.get("code"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Returns the error message when a 429 body has the Instafy proxy shape
+/// `{"error":{"message":...,"retryable":true}}`, and `None` for any other body.
+fn instafy_retryable_error_message(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    let error = parsed.get("error")?;
+    if error.get("retryable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map_or_else(
+            || INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE.to_string(),
+            str::to_string,
+        );
+    Some(message)
+}
+
+/// Reads Retry-After as delta-seconds or an HTTP date and clamps it, so a
+/// hostile or mistaken header cannot stall a turn for minutes.
+fn instafy_retryable_429_delay(headers: Option<&HeaderMap>, now: DateTime<Utc>) -> Duration {
+    extract_header(headers, RETRY_AFTER_HEADER)
+        .and_then(|value| parse_retry_after(value.trim(), now))
+        .unwrap_or(INSTAFY_RETRYABLE_429_DEFAULT_DELAY)
+        .clamp(
+            INSTAFY_RETRYABLE_429_MIN_DELAY,
+            INSTAFY_RETRYABLE_429_MAX_DELAY,
+        )
+}
+
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    // HTTP dates use the RFC 1123 form, which RFC 2822 parsing accepts. A date
+    // that has already passed means the caller may retry right away.
+    let retry_at = DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (retry_at.with_timezone(&Utc) - now)
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 #[derive(Debug, Deserialize)]
