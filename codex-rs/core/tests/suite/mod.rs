@@ -121,6 +121,7 @@ mod responses_lite;
 mod responses_system_proxy;
 mod resume;
 mod resume_warning;
+mod retryable_proxy_rate_limit;
 mod review;
 mod rmcp_client;
 mod rollout_budget;
