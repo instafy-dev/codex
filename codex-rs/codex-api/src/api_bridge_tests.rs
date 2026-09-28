@@ -388,6 +388,29 @@ fn http_date(at: DateTime<Utc>) -> String {
     at.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
+fn fixed_now() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(1_790_000_000, 0).expect("valid timestamp")
+}
+
+/// The delay with the jitter pinned to zero, so tests can compare exact values.
+fn unjittered_delay(retry_after: &str, now: DateTime<Utc>) -> Duration {
+    instafy_retryable_429_delay(
+        Some(&retry_after_headers(retry_after)),
+        now,
+        /*jitter*/ 0.0,
+    )
+}
+
+/// `map_api_error` draws a real jitter sample, so its delay can land anywhere from
+/// the requested wait to 20% above it, never past the 30 second cap.
+fn assert_jittered_delay(delay: Duration, requested: Duration) {
+    let max = (requested + requested / 5).min(Duration::from_secs(30));
+    assert!(
+        (requested..=max).contains(&delay),
+        "delay {delay:?} outside {requested:?}..={max:?}"
+    );
+}
+
 #[test]
 fn map_api_error_maps_instafy_retryable_429_to_stream_retry_with_retry_after() {
     let err = map_429(
@@ -399,71 +422,140 @@ fn map_api_error_maps_instafy_retryable_429_to_stream_retry_with_retry_after() {
         err.is_retryable(),
         "expected a retryable error, got {err:?}"
     );
-    let CodexErr::Stream(message, delay) = &err else {
-        panic!("expected CodexErr::Stream, got {err:?}");
+    let CodexErr::Stream(message, Some(delay)) = &err else {
+        panic!("expected CodexErr::Stream with a delay, got {err:?}");
     };
-    assert_eq!(message, "The upstream provider rate limit was reached.");
-    assert_eq!(*delay, Some(Duration::from_secs(2)));
-    assert!(!err.to_string().contains("exceeded retry limit"));
+    assert_eq!(
+        message,
+        "429 Too Many Requests: The upstream provider rate limit was reached."
+    );
+    assert_jittered_delay(*delay, Duration::from_secs(2));
+    // This is the text a person sees if every stream retry hits the limit too, so
+    // the status has to survive into it.
+    assert_eq!(
+        err.to_string(),
+        "stream disconnected before completion: 429 Too Many Requests: The upstream provider rate limit was reached."
+    );
 }
 
 #[test]
 fn map_api_error_maps_instafy_retryable_429_without_retry_after_to_default_delay() {
     let err = map_429(/*headers*/ None, instafy_proxy_rate_limit_body());
 
-    let CodexErr::Stream(message, delay) = err else {
-        panic!("expected CodexErr::Stream, got {err:?}");
-    };
-    assert_eq!(message, "The upstream provider rate limit was reached.");
-    assert_eq!(delay, Some(Duration::from_secs(5)));
-}
-
-#[test]
-fn map_api_error_reads_instafy_retryable_429_http_date_retry_after() {
-    let retry_at = Utc::now() + chrono::TimeDelta::seconds(20);
-    let err = map_429(
-        Some(retry_after_headers(&http_date(retry_at))),
-        instafy_proxy_rate_limit_body(),
-    );
-
-    let CodexErr::Stream(_, Some(delay)) = err else {
+    let CodexErr::Stream(message, Some(delay)) = err else {
         panic!("expected CodexErr::Stream with a delay, got {err:?}");
     };
-    // The header has whole-second precision and the mapping reads the clock again,
-    // so the delay lands just under the 20 seconds requested.
-    assert!(
-        (Duration::from_secs(18)..=Duration::from_secs(20)).contains(&delay),
-        "unexpected delay {delay:?}"
+    assert_eq!(
+        message,
+        "429 Too Many Requests: The upstream provider rate limit was reached."
+    );
+    assert_jittered_delay(delay, Duration::from_secs(5));
+}
+
+#[test]
+fn instafy_retryable_429_delay_reads_http_date_retry_after() {
+    let now = fixed_now();
+    let retry_at = now + chrono::TimeDelta::seconds(20);
+
+    assert_eq!(
+        unjittered_delay(&http_date(retry_at), now),
+        Duration::from_secs(20)
     );
 }
 
 #[test]
-fn map_api_error_clamps_instafy_retryable_429_retry_after() {
-    let past = http_date(Utc::now() - chrono::TimeDelta::seconds(60));
-    let far_future = http_date(Utc::now() + chrono::TimeDelta::seconds(3_600));
+fn instafy_retryable_429_delay_parses_and_clamps_retry_after() {
+    let now = fixed_now();
+    let past = http_date(now - chrono::TimeDelta::seconds(60));
+    let far_future = http_date(now + chrono::TimeDelta::seconds(3_600));
     let cases = [
+        ("2", Duration::from_secs(2)),
+        (" 7 ", Duration::from_secs(7)),
         ("0", Duration::from_secs(1)),
         ("3600", Duration::from_secs(30)),
+        // A fraction rounds up so the retry cannot land inside the window.
+        ("1.5", Duration::from_secs(2)),
+        ("2.0", Duration::from_secs(2)),
+        ("0.2", Duration::from_secs(1)),
+        // A negative value or a past date means the window has passed.
+        ("-5", Duration::from_secs(1)),
+        ("-1.5", Duration::from_secs(1)),
         (past.as_str(), Duration::from_secs(1)),
+        // Values beyond u64 seconds or a Duration saturate instead of being ignored.
+        ("18446744073709551616", Duration::from_secs(30)),
+        ("99999999999999999999999999", Duration::from_secs(30)),
         (far_future.as_str(), Duration::from_secs(30)),
+        // Anything that is neither delta-seconds nor a date gets the default.
         ("soon", Duration::from_secs(5)),
+        ("inf", Duration::from_secs(5)),
+        ("NaN", Duration::from_secs(5)),
+        ("1e3", Duration::from_secs(5)),
+        ("+5", Duration::from_secs(5)),
+        ("1.2.3", Duration::from_secs(5)),
+        (".", Duration::from_secs(5)),
+        ("-", Duration::from_secs(5)),
+        ("", Duration::from_secs(5)),
     ];
 
     for (retry_after, expected) in cases {
-        let err = map_429(
-            Some(retry_after_headers(retry_after)),
-            instafy_proxy_rate_limit_body(),
+        assert_eq!(
+            unjittered_delay(retry_after, now),
+            expected,
+            "Retry-After {retry_after:?}"
         );
-        let CodexErr::Stream(_, delay) = err else {
-            panic!("expected CodexErr::Stream for Retry-After {retry_after:?}, got {err:?}");
-        };
-        assert_eq!(delay, Some(expected), "Retry-After {retry_after:?}");
     }
 }
 
 #[test]
+fn instafy_retryable_429_delay_adds_bounded_positive_jitter() {
+    let now = fixed_now();
+    let cases = [
+        (Some("2"), 0.0, Duration::from_millis(2_000)),
+        (Some("2"), 0.5, Duration::from_millis(2_200)),
+        (Some("2"), 1.0, Duration::from_millis(2_400)),
+        (None, 1.0, Duration::from_secs(6)),
+        // Jitter never pushes the wait past the cap.
+        (Some("28"), 1.0, Duration::from_secs(30)),
+        (Some("3600"), 1.0, Duration::from_secs(30)),
+        // A sample outside [0, 1] is pinned to that range.
+        (Some("2"), 2.0, Duration::from_millis(2_400)),
+        (Some("2"), -1.0, Duration::from_millis(2_000)),
+    ];
+
+    for (retry_after, jitter, expected) in cases {
+        let headers = retry_after.map(retry_after_headers);
+        assert_eq!(
+            instafy_retryable_429_delay(headers.as_ref(), now, jitter),
+            expected,
+            "Retry-After {retry_after:?} with jitter {jitter}"
+        );
+    }
+}
+
+#[test]
+fn retry_jitter_sample_stays_in_unit_interval_and_varies() {
+    let samples: Vec<f64> = (0..64).map(|_| retry_jitter_sample()).collect();
+
+    assert!(
+        samples.iter().all(|sample| (0.0..=1.0).contains(sample)),
+        "samples outside [0, 1]: {samples:?}"
+    );
+    // 64 draws from 2^32 values landing on a single one would mean the source is
+    // not random and every runtime would still retry at the same instant.
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.to_bits() != samples[0].to_bits()),
+        "samples never varied: {samples:?}"
+    );
+}
+
+#[test]
 fn map_api_error_uses_fallback_message_for_instafy_retryable_429_without_message() {
-    let body = serde_json::json!({ "error": { "retryable": true } }).to_string();
+    let body = serde_json::json!({
+        "error": { "type": "upstream_error", "retryable": true }
+    })
+    .to_string();
     let err = map_429(/*headers*/ None, body);
 
     let CodexErr::Stream(message, _) = err else {
@@ -471,7 +563,7 @@ fn map_api_error_uses_fallback_message_for_instafy_retryable_429_without_message
     };
     assert_eq!(
         message,
-        "The AI provider is rate limiting requests (429 Too Many Requests)."
+        "429 Too Many Requests: The AI provider is rate limiting requests."
     );
 }
 
@@ -489,13 +581,32 @@ fn map_api_error_keeps_non_retryable_429_as_retry_limit() {
         serde_json::json!({
             "error": {
                 "message": "The upstream provider rate limit was reached.",
+                "type": "upstream_error",
                 "code": "upstream_rate_limit",
                 "retryable": false
             }
         })
         .to_string(),
-        serde_json::json!({ "error": { "retryable": "true" } }).to_string(),
-        serde_json::json!({ "retryable": true }).to_string(),
+        // Another provider's retryable body keeps the old handling.
+        serde_json::json!({
+            "error": {
+                "message": "Rate limit reached for requests",
+                "type": "rate_limit_exceeded",
+                "retryable": true
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "error": {
+                "message": "The upstream provider rate limit was reached.",
+                "code": "upstream_rate_limit",
+                "retryable": true
+            }
+        })
+        .to_string(),
+        serde_json::json!({ "error": { "type": "upstream_error", "retryable": "true" } })
+            .to_string(),
+        serde_json::json!({ "type": "upstream_error", "retryable": true }).to_string(),
         "Too Many Requests".to_string(),
     ];
 

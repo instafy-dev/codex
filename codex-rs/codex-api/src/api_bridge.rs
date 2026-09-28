@@ -15,6 +15,7 @@ use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
+use uuid::Uuid;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
     match err {
@@ -119,10 +120,16 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     // answers with a 429 whose body is marked retryable and leaves the retry to
                     // this client. A stream error sends the turn through the stream retry budget
                     // after the proxy's delay, instead of ending it on a RetryLimit that claims
-                    // retries were made when none were.
+                    // retries were made when none were. A stream error carries no status code,
+                    // so the status leads the message: once the budget runs out, whatever reads
+                    // the final error can still tell it was a 429.
                     if let Some(message) = instafy_retryable_error_message(&body_text) {
-                        let delay = instafy_retryable_429_delay(headers.as_ref(), Utc::now());
-                        return CodexErr::Stream(message, Some(delay));
+                        let delay = instafy_retryable_429_delay(
+                            headers.as_ref(),
+                            Utc::now(),
+                            retry_jitter_sample(),
+                        );
+                        return CodexErr::Stream(format!("{status}: {message}"), Some(delay));
                     }
 
                     CodexErr::RetryLimit(RetryLimitReachedError {
@@ -170,14 +177,20 @@ const CYBER_POLICY_FALLBACK_MESSAGE: &str =
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =
     "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
 const RETRY_AFTER_HEADER: &str = "retry-after";
-const INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE: &str =
-    "The AI provider is rate limiting requests (429 Too Many Requests).";
-// Instafy runtimes allow a single stream retry, so the wait should outlast a short
-// rate-limit window without spending much of the run's time budget. A missing or
-// unreadable Retry-After gets a few seconds rather than the sub-second backoff.
+const INSTAFY_UPSTREAM_ERROR_TYPE: &str = "upstream_error";
+const INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE: &str = "The AI provider is rate limiting requests.";
+// Bounded Instafy proxy runs allow one stream retry per sampling request, and other runs
+// keep the provider's default stream retry count. Either way the count starts over for
+// each sampling request, so a single wait should outlast a short rate-limit window
+// without spending much of a bounded run's time budget. A missing or unreadable
+// Retry-After gets a few seconds rather than the sub-second backoff.
 const INSTAFY_RETRYABLE_429_DEFAULT_DELAY: Duration = Duration::from_secs(5);
 const INSTAFY_RETRYABLE_429_MIN_DELAY: Duration = Duration::from_secs(1);
 const INSTAFY_RETRYABLE_429_MAX_DELAY: Duration = Duration::from_secs(30);
+// Managed runtimes share one upstream key, so turns that hit the same limit get the same
+// Retry-After and would all retry at the same instant. Waiting up to this much longer,
+// never shorter, spreads them out while still honoring the proxy's floor.
+const INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT: u32 = 20;
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -225,11 +238,14 @@ fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String> {
 }
 
 /// Returns the error message when a 429 body has the Instafy proxy shape
-/// `{"error":{"message":...,"retryable":true}}`, and `None` for any other body.
+/// `{"error":{"type":"upstream_error","message":...,"retryable":true}}`, and `None`
+/// for any other body, so another provider's retryable 429 keeps its old handling.
 fn instafy_retryable_error_message(body: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(body).ok()?;
     let error = parsed.get("error")?;
-    if error.get("retryable").and_then(Value::as_bool) != Some(true) {
+    if error.get("type").and_then(Value::as_str) != Some(INSTAFY_UPSTREAM_ERROR_TYPE)
+        || error.get("retryable").and_then(Value::as_bool) != Some(true)
+    {
         return None;
     }
     let message = error
@@ -245,20 +261,39 @@ fn instafy_retryable_error_message(body: &str) -> Option<String> {
 }
 
 /// Reads Retry-After as delta-seconds or an HTTP date and clamps it, so a
-/// hostile or mistaken header cannot stall a turn for minutes.
-fn instafy_retryable_429_delay(headers: Option<&HeaderMap>, now: DateTime<Utc>) -> Duration {
-    extract_header(headers, RETRY_AFTER_HEADER)
+/// hostile or mistaken header cannot stall a turn for minutes, then adds up to
+/// `INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT` on top without passing the cap.
+/// `jitter` is a sample from [0, 1] that picks where in that spread the retry lands;
+/// it is a parameter so tests can pin it.
+fn instafy_retryable_429_delay(
+    headers: Option<&HeaderMap>,
+    now: DateTime<Utc>,
+    jitter: f64,
+) -> Duration {
+    let requested = extract_header(headers, RETRY_AFTER_HEADER)
         .and_then(|value| parse_retry_after(value.trim(), now))
         .unwrap_or(INSTAFY_RETRYABLE_429_DEFAULT_DELAY)
         .clamp(
             INSTAFY_RETRYABLE_429_MIN_DELAY,
             INSTAFY_RETRYABLE_429_MAX_DELAY,
-        )
+        );
+    let max_spread = requested * INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT / 100;
+    let spread = max_spread.mul_f64(jitter.clamp(0.0, 1.0));
+    (requested + spread).min(INSTAFY_RETRYABLE_429_MAX_DELAY)
+}
+
+/// A uniform sample from [0, 1] for spreading retries. The leading bytes of a v4
+/// UUID are random, and this crate already makes v4 UUIDs for request ids, so the
+/// spread needs no new dependency.
+fn retry_jitter_sample() -> f64 {
+    let bytes = Uuid::new_v4().into_bytes();
+    let sample = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    f64::from(sample) / f64::from(u32::MAX)
 }
 
 fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+    if let Some(delay) = parse_retry_after_seconds(value) {
+        return Some(delay);
     }
     // HTTP dates use the RFC 1123 form, which RFC 2822 parsing accepts. A date
     // that has already passed means the caller may retry right away.
@@ -268,6 +303,32 @@ fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
             .to_std()
             .unwrap_or(Duration::ZERO),
     )
+}
+
+/// RFC 9110 delta-seconds is a whole number, but proxies and SDKs also send
+/// fractions and the odd negative value. A fraction rounds up so the retry never
+/// lands inside the window, a negative value means the window has already passed,
+/// and a value too large for a `Duration` saturates. The caller clamps all three.
+/// Anything other than an optional minus sign, digits and one decimal point (for
+/// example `inf`, `1e3` or `+5`) is not delta-seconds and falls through to date
+/// parsing.
+fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
+    let (negative, magnitude) = match value.strip_prefix('-') {
+        Some(magnitude) => (true, magnitude),
+        None => (false, value),
+    };
+    if !magnitude
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    // Rejects an empty string, a lone point and more than one point.
+    let seconds = magnitude.parse::<f64>().ok()?;
+    if negative {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::try_from_secs_f64(seconds.ceil()).unwrap_or(Duration::MAX))
 }
 
 #[derive(Debug, Deserialize)]
