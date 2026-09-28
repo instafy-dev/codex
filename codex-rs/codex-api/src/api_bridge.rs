@@ -261,25 +261,33 @@ fn instafy_retryable_error_message(body: &str) -> Option<String> {
 }
 
 /// Reads Retry-After as delta-seconds or an HTTP date and clamps it, so a
-/// hostile or mistaken header cannot stall a turn for minutes, then adds up to
-/// `INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT` on top without passing the cap.
+/// hostile or mistaken header cannot stall a turn for minutes, then spreads the
+/// retry by up to `INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT` so runtimes sharing
+/// one key do not all retry at the same instant. Below the cap the spread only
+/// lengthens the wait and uses the room left under the cap; when the server asked
+/// for the cap or longer, the wait is already shorter than asked, so the spread
+/// goes below the cap instead of pinning every retry to exactly the cap.
 /// `jitter` is a sample from [0, 1] that picks where in that spread the retry lands;
-/// it is a parameter so tests can pin it.
+/// it is a parameter so tests can pin it (0 means no spread).
 fn instafy_retryable_429_delay(
     headers: Option<&HeaderMap>,
     now: DateTime<Utc>,
     jitter: f64,
 ) -> Duration {
-    let requested = extract_header(headers, RETRY_AFTER_HEADER)
+    let asked = extract_header(headers, RETRY_AFTER_HEADER)
         .and_then(|value| parse_retry_after(value.trim(), now))
-        .unwrap_or(INSTAFY_RETRYABLE_429_DEFAULT_DELAY)
-        .clamp(
-            INSTAFY_RETRYABLE_429_MIN_DELAY,
-            INSTAFY_RETRYABLE_429_MAX_DELAY,
-        );
+        .unwrap_or(INSTAFY_RETRYABLE_429_DEFAULT_DELAY);
+    let requested = asked.clamp(
+        INSTAFY_RETRYABLE_429_MIN_DELAY,
+        INSTAFY_RETRYABLE_429_MAX_DELAY,
+    );
+    let jitter = jitter.clamp(0.0, 1.0);
     let max_spread = requested * INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT / 100;
-    let spread = max_spread.mul_f64(jitter.clamp(0.0, 1.0));
-    (requested + spread).min(INSTAFY_RETRYABLE_429_MAX_DELAY)
+    if asked >= INSTAFY_RETRYABLE_429_MAX_DELAY {
+        return INSTAFY_RETRYABLE_429_MAX_DELAY - max_spread.mul_f64(jitter);
+    }
+    let room = max_spread.min(INSTAFY_RETRYABLE_429_MAX_DELAY - requested);
+    requested + room.mul_f64(jitter)
 }
 
 /// A uniform sample from [0, 1] for spreading retries. The leading bytes of a v4

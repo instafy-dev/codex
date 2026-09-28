@@ -464,6 +464,30 @@ fn instafy_retryable_429_delay_reads_http_date_retry_after() {
 }
 
 #[test]
+fn map_api_error_spreads_retryable_429_delays() {
+    // Runtimes that share one upstream key get the same Retry-After, so the delay
+    // map_api_error hands back must differ between calls or they retry together.
+    let delays: Vec<Duration> = (0..16)
+        .map(|_| {
+            let err = map_429(
+                Some(retry_after_headers("2")),
+                instafy_proxy_rate_limit_body(),
+            );
+            let CodexErr::Stream(_, Some(delay)) = err else {
+                panic!("expected CodexErr::Stream with a delay, got {err:?}");
+            };
+            assert_jittered_delay(delay, Duration::from_secs(2));
+            delay
+        })
+        .collect();
+    assert!(
+        delays.iter().any(|delay| *delay != delays[0]),
+        "every mapped delay was {:?}; jitter is not applied",
+        delays[0]
+    );
+}
+
+#[test]
 fn instafy_retryable_429_delay_parses_and_clamps_retry_after() {
     let now = fixed_now();
     let past = http_date(now - chrono::TimeDelta::seconds(60));
@@ -514,9 +538,15 @@ fn instafy_retryable_429_delay_adds_bounded_positive_jitter() {
         (Some("2"), 0.5, Duration::from_millis(2_200)),
         (Some("2"), 1.0, Duration::from_millis(2_400)),
         (None, 1.0, Duration::from_secs(6)),
-        // Jitter never pushes the wait past the cap.
+        // Below the cap the spread uses only the room left under it, so a long
+        // wait still spreads instead of piling up at exactly the cap.
+        (Some("28"), 0.5, Duration::from_secs(29)),
         (Some("28"), 1.0, Duration::from_secs(30)),
-        (Some("3600"), 1.0, Duration::from_secs(30)),
+        // At or past the cap the spread goes below it: 30 s down to 24 s.
+        (Some("30"), 0.0, Duration::from_secs(30)),
+        (Some("3600"), 0.0, Duration::from_secs(30)),
+        (Some("3600"), 0.5, Duration::from_secs(27)),
+        (Some("3600"), 1.0, Duration::from_secs(24)),
         // A sample outside [0, 1] is pinned to that range.
         (Some("2"), 2.0, Duration::from_millis(2_400)),
         (Some("2"), -1.0, Duration::from_millis(2_000)),
