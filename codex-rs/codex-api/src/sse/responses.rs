@@ -322,6 +322,10 @@ pub struct ResponsesStreamProgress {
     /// output, which the turn's next request hands the model. A call the upstream finalized
     /// with status "incomplete" never becomes that event.
     tool_call_done: bool,
+    /// Instafy: set once a tool call that core runs was not passed on because the upstream
+    /// finalized it as incomplete. The response was cut off, so it ends with the incomplete
+    /// error even when a `response.completed` ends it.
+    incomplete_call_dropped: bool,
 }
 
 /// Instafy: whether core runs `item` as a tool call when it completes, and so records an
@@ -378,6 +382,24 @@ impl ResponsesEventError {
     }
 }
 
+/// Instafy: the error an incomplete response ends its request with (see
+/// "response.incomplete"), given the event's `response` object.
+fn incomplete_response_error(
+    progress: &ResponsesStreamProgress,
+    response: Option<&Value>,
+) -> ResponsesEventError {
+    let reason = response
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = format!("{INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX} {reason}");
+    if progress.tool_call_done {
+        return ResponsesEventError::Api(ApiError::Stream(message));
+    }
+    ResponsesEventError::Api(ApiError::InvalidRequest { message })
+}
+
 pub fn process_responses_event(
     event: ResponsesStreamEvent,
     progress: &mut ResponsesStreamProgress,
@@ -398,6 +420,7 @@ pub fn process_responses_event(
                         // as for a stream that ends before a call is done.
                         if finalized_incomplete {
                             debug!("dropping a tool call the upstream finalized as incomplete");
+                            progress.incomplete_call_dropped = true;
                             return Ok(None);
                         }
                         progress.tool_call_done = true;
@@ -514,22 +537,15 @@ pub fn process_responses_event(
             // The websocket transport parses its events here too. Compaction re-sends the same
             // request on any retry, so it recognizes both errors by their message prefix
             // (`is_instafy_incomplete_response`) and does not retry either.
-            let reason = event.response.as_ref().and_then(|response| {
-                response
-                    .get("incomplete_details")
-                    .and_then(|details| details.get("reason"))
-                    .and_then(Value::as_str)
-            });
-            let reason = reason.unwrap_or("unknown");
-            let message = format!("{INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX} {reason}");
-            if progress.tool_call_done {
-                return Err(ResponsesEventError::Api(ApiError::Stream(message)));
-            }
-            return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
-                message,
-            }));
+            return Err(incomplete_response_error(progress, event.response.as_ref()));
         }
         "response.completed" => {
+            // Instafy: a response that cut off a tool call, which was then not passed on (see
+            // "response.output_item.done"), was incomplete whatever event ends it. Completing
+            // it would end the turn with no output and no error.
+            if progress.incomplete_call_dropped {
+                return Err(incomplete_response_error(progress, event.response.as_ref()));
+            }
             if let Some(resp_val) = event.response {
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
                     Ok(resp) => {
@@ -1667,6 +1683,69 @@ mod tests {
                     error,
                     "Incomplete response returned, reason: max_output_tokens",
                 );
+            }
+        }
+    }
+
+    /// A response that cuts a tool call off but ends with `response.completed` rather than
+    /// `response.incomplete`. The call is still not passed on, and the response ends with the
+    /// incomplete error instead of completing a turn that has no output: not retryable on its
+    /// own, a continuation after a finished call.
+    #[tokio::test]
+    async fn completed_after_a_tool_call_finalized_as_incomplete_ends_with_the_incomplete_error() {
+        let cut_off = json!({
+            "type": "function_call",
+            "status": "incomplete",
+            "call_id": "call_cut_off",
+            "name": "shell_command",
+            "arguments": "{\"command\":\"echo cut"
+        });
+        for (completed, message) in [
+            (
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_cut_off",
+                        "status": "incomplete",
+                        "incomplete_details": { "reason": "max_output_tokens" },
+                    },
+                }),
+                "Incomplete response returned, reason: max_output_tokens",
+            ),
+            (
+                json!({
+                    "type": "response.completed",
+                    "response": { "id": "resp_cut_off", "status": "completed" },
+                }),
+                "Incomplete response returned, reason: unknown",
+            ),
+        ] {
+            let mut started = cut_off.clone();
+            started["status"] = json!("in_progress");
+            let outcomes = outcomes_after(&[
+                json!({ "type": "response.output_item.added", "item": started }),
+                output_item_done(cut_off.clone()),
+                completed.clone(),
+            ])
+            .await;
+            for (passed_on, error) in outcomes {
+                assert_matches!(passed_on.as_slice(), [ResponseEvent::OutputItemAdded(_)]);
+                assert_incomplete_error(error, message);
+            }
+
+            let outcomes = outcomes_after(&[
+                function_call_done_event(),
+                output_item_done(cut_off.clone()),
+                completed,
+            ])
+            .await;
+            for (passed_on, error) in outcomes {
+                assert_matches!(
+                    passed_on.as_slice(),
+                    [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. })]
+                        if call_id == "call_before_cap"
+                );
+                assert_incomplete_continuation_error(error, message);
             }
         }
     }
