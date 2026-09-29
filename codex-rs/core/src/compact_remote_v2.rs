@@ -357,8 +357,8 @@ async fn run_remote_compaction_request_v2(
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
             Err(err) if !err.is_retryable() => return Err(err),
-            // Instafy: an incomplete response that followed a completed output item is a
-            // retryable stream error, because a turn's retry continues from the recorded item.
+            // Instafy: an incomplete response that followed a completed tool call is a
+            // retryable stream error, because a turn's retry continues with the call's output.
             // This retry sends the same prompt again instead, so it would most likely end the
             // same way and be billed again.
             Err(err) if codex_api::is_instafy_incomplete_response(&err) => return Err(err),

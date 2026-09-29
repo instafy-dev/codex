@@ -681,7 +681,7 @@ fn map_api_error_keeps_usage_limit_429_terminal_even_when_marked_retryable() {
 #[test]
 fn is_instafy_incomplete_response_matches_only_the_incomplete_errors() {
     let message = "Incomplete response returned, reason: content_filter";
-    // The error before any output item completed, and the retryable one after an item did:
+    // The error when no tool call completed first, and the retryable one after a call did:
     // compaction re-sends the same request on either.
     assert!(is_instafy_incomplete_response(&CodexErr::InvalidRequest(
         message.to_string()

@@ -322,7 +322,7 @@ async fn run_compact_task_inner_impl(
                 // Instafy: local compaction retries every other error, but an incomplete
                 // response has been produced and billed, and would most likely end the same
                 // way again. Every attempt sends the history taken before the first one, so
-                // that holds even when an output item completed before the incomplete event.
+                // that holds even when a tool call completed before the incomplete event.
                 // It ends the compaction as an error that is out of retries does.
                 if retries < max_retries && !codex_api::is_instafy_incomplete_response(&e) {
                     retries += 1;

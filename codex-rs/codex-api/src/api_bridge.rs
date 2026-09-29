@@ -269,13 +269,13 @@ fn instafy_retryable_error_message(body: &str) -> Option<String> {
 /// Instafy bills that response once the upstream has produced it, and a max_output_tokens
 /// cap or a content_filter stop would most likely end the same way on the same request.
 ///
-/// Before any output item that core records in the conversation history completed, the
-/// error is an InvalidRequest, so the stream retry budget already leaves it alone. After one
-/// completed, it is a retryable stream error, because the turn's retry rebuilds its request
-/// from the history that now holds that item and its tool output, and so continues rather
-/// than repeats.
+/// Unless a tool call that core runs completed first, the error is an InvalidRequest, so the
+/// stream retry budget already leaves it alone. A completed reasoning item or message does
+/// not change that. After a tool call completed, it is a retryable stream error, because the
+/// turn's retry rebuilds its request from the history that now holds the call and its
+/// output, and so continues rather than repeats.
 ///
-/// Compaction sends the same request on every retry, whether or not an item completed: the
+/// Compaction sends the same request on every retry, whether or not a call completed: the
 /// remote compaction stream retry, the fallback to the current model after the previous
 /// model failed, and local compaction, which retries any error. Those callers check this
 /// first, so it matches both errors.

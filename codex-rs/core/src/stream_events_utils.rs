@@ -292,6 +292,9 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.mode == ModeKind::Plan;
 
+    // Instafy: `is_tool_call_core_runs` in codex-api/src/sse/responses.rs lists the items
+    // this sets `needs_follow_up` for, to decide whether an incomplete response may be
+    // retried. Keep the two in step.
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {

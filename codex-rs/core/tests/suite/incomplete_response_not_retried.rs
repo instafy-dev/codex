@@ -1,13 +1,16 @@
 //! Instafy bills every response the upstream produces, including one that stops early.
-//! When no output item that the turn records in its history completed before the stop, a
-//! retry sends the same request again, and a response cut off by max_output_tokens or
-//! stopped by content_filter would most likely end the same way. These tests run whole turns and compactions with a stream
-//! retry budget to check that such a response is requested once and ends the turn with
-//! its reason.
+//! When no tool call that the turn runs completed before the stop, a retry sends the same
+//! input again, at most with the model's own completed output appended, and a response cut
+//! off by max_output_tokens or stopped by content_filter would most likely end the same way.
+//! The managed models complete a reasoning item before every answer, so that is the usual
+//! case. These tests run whole turns and compactions with a stream retry budget, over HTTP
+//! and over the Responses websocket, to check that such a response is requested once and
+//! ends the turn with its reason.
 //!
-//! Once an output item has completed, the turn has recorded it and run its tool call, and
-//! its retry rebuilds the request from that history: it continues with the tool output, as
-//! any follow-up does, and must still be sent. Compaction retries send the same request
+//! Once a tool call has completed, the turn has recorded it and run it, and its retry
+//! rebuilds the request from that history: it continues with the tool output, as any
+//! follow-up does, and must still be sent. A tool call the upstream finalized as incomplete
+//! was cut off by the same stop and does not count. Compaction retries send the same request
 //! either way, so a compaction is requested once in both cases.
 
 use anyhow::Result;
@@ -76,31 +79,43 @@ fn ev_incomplete(reason: &str) -> Value {
     })
 }
 
-/// Serves the same incomplete response to every request, so a retry would reach the
-/// mock and be counted rather than fail for lack of a response. The response completes the
-/// output items in `finished`, then stops for `reason` in the middle of a message.
-async fn mount_incomplete_response(server: &MockServer, finished: Vec<Value>, reason: &str) {
-    let mut events = vec![ev_response_created("resp_incomplete")];
-    events.extend(finished);
-    events.extend([
+/// The output of a response that completes the output items in `finished`, then is stopped
+/// in the middle of an answer.
+fn cut_off_answer(finished: Vec<Value>) -> Vec<Value> {
+    let mut output = finished;
+    output.extend([
         ev_message_item_added("msg_incomplete", "partial content"),
         ev_output_text_delta("continued chunk"),
-        ev_incomplete(reason),
     ]);
+    output
+}
+
+/// The events of a response that streams `output` and then stops for `reason`.
+fn incomplete_response(output: Vec<Value>, reason: &str) -> Vec<Value> {
+    let mut events = vec![ev_response_created("resp_incomplete")];
+    events.extend(output);
+    events.push(ev_incomplete(reason));
+    events
+}
+
+/// Serves the same incomplete response, which streams `output` and then stops for
+/// `reason`, to every request, so a retry would reach the mock and be counted rather than
+/// fail for lack of a response.
+async fn mount_incomplete_response(server: &MockServer, output: Vec<Value>, reason: &str) {
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
-        .respond_with(sse_response(sse(events)))
+        .respond_with(sse_response(sse(incomplete_response(output, reason))))
         .mount(server)
         .await;
 }
 
 /// Finishes the first request, a normal turn, with `completed`, and answers every later
 /// one, the compaction and anything that would send it again, with an incomplete response
-/// that completes `finished` first.
+/// that streams `output` first.
 async fn mount_completed_then_incomplete_responses(
     server: &MockServer,
     completed: Value,
-    finished: Vec<Value>,
+    output: Vec<Value>,
     reason: &str,
 ) {
     Mock::given(method("POST"))
@@ -113,12 +128,43 @@ async fn mount_completed_then_incomplete_responses(
         .up_to_n_times(1)
         .mount(server)
         .await;
-    mount_incomplete_response(server, finished, reason).await;
+    mount_incomplete_response(server, output, reason).await;
 }
 
-/// A reasoning item, which a compaction response can complete before its compaction item.
-fn finished_reasoning_item() -> Vec<Value> {
-    vec![ev_reasoning_item("rs_finished", &["summarizing"], &[])]
+/// A completed reasoning item, which the managed models produce before every answer.
+fn finished_reasoning_item() -> Value {
+    ev_reasoning_item("rs_finished", &["planning the answer"], &[])
+}
+
+/// A completed tool call, after which an incomplete response is the retryable stream error.
+fn finished_tool_call() -> Value {
+    ev_shell_command_call("call_finished", "echo finished")
+}
+
+/// A tool call that the upstream finalized as incomplete: the stop cut its arguments off.
+fn tool_call_finalized_as_incomplete() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_cut_off",
+                "name": "shell_command",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "status": "incomplete",
+                "call_id": "call_cut_off",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo cut"
+            }
+        }),
+    ]
 }
 
 /// The JSON body of every request that reached the Responses endpoint, in order.
@@ -229,14 +275,14 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
     model_info
 }
 
-/// Runs a turn whose response completes `finished`, which core does not record, and then
+/// Runs a turn whose response streams `output`, which holds no finished tool call, and then
 /// stops for `reason`, and checks that it is requested once and ends the turn with its reason.
 async fn assert_incomplete_response_is_requested_once(
-    finished: Vec<Value>,
+    output: Vec<Value>,
     reason: &str,
 ) -> Result<()> {
     let server = start_mock_server().await;
-    mount_incomplete_response(&server, finished, reason).await;
+    mount_incomplete_response(&server, output, reason).await;
     // Five stream retries is the provider default that browser sessions keep, and no
     // request-level retries keeps every attempt visible to the mock.
     let test = test_codex()
@@ -273,16 +319,117 @@ async fn assert_incomplete_response_is_requested_once(
     Ok(())
 }
 
+/// The same check over the Responses websocket, which parses its events with its own
+/// per-request state and opens a new connection for a retry.
+async fn assert_incomplete_response_is_requested_once_over_websocket(
+    output: Vec<Value>,
+    reason: &str,
+) -> Result<()> {
+    let response = incomplete_response(output, reason);
+    // The session's startup prewarm comes first. Every later connection serves the same
+    // incomplete response, so each retry the stream retry budget allows would be counted.
+    let mut connections = vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        response.clone(),
+    ]];
+    connections.extend(std::iter::repeat_n(vec![response], 5));
+    let server = start_websocket_server(connections).await;
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(5);
+    });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.codex
+        .submit(user_turn("trigger incomplete", /*model*/ None))
+        .await?;
+    let (stream_errors, errors, completed) = turn_errors(&test.codex).await;
+
+    assert_eq!(
+        server
+            .connections()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "an incomplete response must be requested once, after the prewarm"
+    );
+    assert!(
+        stream_errors.is_empty(),
+        "an incomplete response must not be retried: {stream_errors:?}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("Incomplete response returned, reason: {reason}").as_str()]
+    );
+    assert_eq!(completed.error.as_ref(), errors.first());
+
+    server.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_max_output_tokens_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    assert_incomplete_response_is_requested_once(/*finished*/ Vec::new(), "max_output_tokens").await
+    assert_incomplete_response_is_requested_once(cut_off_answer(Vec::new()), "max_output_tokens")
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_content_filter_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    assert_incomplete_response_is_requested_once(/*finished*/ Vec::new(), "content_filter").await
+    assert_incomplete_response_is_requested_once(cut_off_answer(Vec::new()), "content_filter").await
+}
+
+/// The managed models are reasoning models: every response completes a reasoning item
+/// before the answer, so a cap that cuts the answer off always follows one. A retry sends the
+/// same input plus that reasoning, with no tool output and the same cap, and must not be sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_after_reasoning_and_a_partial_message_is_requested_once() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    assert_incomplete_response_is_requested_once(
+        cut_off_answer(vec![finished_reasoning_item()]),
+        "max_output_tokens",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_after_reasoning_and_a_partial_message_is_requested_once_over_websocket()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    assert_incomplete_response_is_requested_once_over_websocket(
+        cut_off_answer(vec![finished_reasoning_item()]),
+        "max_output_tokens",
+    )
+    .await
+}
+
+/// A tool call the upstream finalized as incomplete was cut off by the same stop, so its
+/// arguments are truncated. It is not a finished call whose output the model could continue
+/// from, and the response must not be sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_requested_once() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    assert_incomplete_response_is_requested_once(
+        tool_call_finalized_as_incomplete(),
+        "max_output_tokens",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_requested_once_over_websocket()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    assert_incomplete_response_is_requested_once_over_websocket(
+        tool_call_finalized_as_incomplete(),
+        "max_output_tokens",
+    )
+    .await
 }
 
 /// A completed item of a type this client does not know parses as `Other`, which core drops
@@ -292,7 +439,7 @@ async fn incomplete_content_filter_is_requested_once() -> Result<()> {
 async fn incomplete_after_only_an_unrecorded_item_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_response_is_requested_once(
-        vec![json!({
+        cut_off_answer(vec![json!({
             "type": "response.output_item.done",
             "item": {
                 "type": "mcp_list_tools",
@@ -300,7 +447,7 @@ async fn incomplete_after_only_an_unrecorded_item_is_requested_once() -> Result<
                 "server_label": "docs",
                 "tools": []
             }
-        })],
+        })]),
         "max_output_tokens",
     )
     .await
@@ -462,29 +609,29 @@ async fn incomplete_after_a_finished_tool_call_continues_over_websocket() -> Res
 async fn incomplete_compaction_is_not_sent_again_on_the_current_model() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_compaction_is_requested_once(
-        /*finished*/ Vec::new(),
+        cut_off_answer(Vec::new()),
         "Error running remote compact task: Incomplete response returned, reason: max_output_tokens",
     )
     .await
 }
 
-/// After a completed output item the incomplete response is a retryable stream error, but
+/// After a completed tool call the incomplete response is a retryable stream error, but
 /// the compaction stream retry sends the same prompt again, so it must not retry it either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_compaction_after_a_finished_item_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_compaction_is_requested_once(
-        finished_reasoning_item(),
+        cut_off_answer(vec![finished_tool_call()]),
         "Error running remote compact task: stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
     )
     .await
 }
 
 /// Switches to a model with a smaller context window, which runs a remote compaction on the
-/// previous model that ends incomplete after completing `finished`, and checks that it is
+/// previous model that ends incomplete after streaming `output`, and checks that it is
 /// requested once and ends the turn with `expected_error`.
 async fn assert_incomplete_compaction_is_requested_once(
-    finished: Vec<Value>,
+    output: Vec<Value>,
     expected_error: &str,
 ) -> Result<()> {
     // `start_mock_server` mounts an empty model list first, which would shadow this one.
@@ -505,7 +652,7 @@ async fn assert_incomplete_compaction_is_requested_once(
     mount_completed_then_incomplete_responses(
         &server,
         ev_completed_with_tokens("resp_first", /*total_tokens*/ 120_000),
-        finished,
+        output,
         "max_output_tokens",
     )
     .await;
@@ -564,35 +711,35 @@ async fn assert_incomplete_compaction_is_requested_once(
 async fn incomplete_local_compaction_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_local_compaction_is_requested_once(
-        /*finished*/ Vec::new(),
+        cut_off_answer(Vec::new()),
         "Incomplete response returned, reason: content_filter",
     )
     .await
 }
 
 /// Every local compaction attempt sends the history taken before the first one, so a retry
-/// after a completed output item would send the same request again too.
+/// after a completed tool call would send the same request again too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_local_compaction_after_a_finished_item_is_requested_once() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_local_compaction_is_requested_once(
-        finished_reasoning_item(),
+        cut_off_answer(vec![finished_tool_call()]),
         "stream disconnected before completion: Incomplete response returned, reason: content_filter",
     )
     .await
 }
 
-/// Runs a turn, then a local compaction that ends incomplete after completing `finished`,
-/// and checks that the compaction is requested once and ends with `expected_error`.
+/// Runs a turn, then a local compaction that ends incomplete after streaming `output`, and
+/// checks that the compaction is requested once and ends with `expected_error`.
 async fn assert_incomplete_local_compaction_is_requested_once(
-    finished: Vec<Value>,
+    output: Vec<Value>,
     expected_error: &str,
 ) -> Result<()> {
     let server = start_mock_server().await;
     mount_completed_then_incomplete_responses(
         &server,
         ev_completed("resp_first"),
-        finished,
+        output,
         "content_filter",
     )
     .await;

@@ -317,36 +317,52 @@ fn json_value_as_string(value: &Value) -> Option<String> {
 /// `process_responses_event` with every event of that request.
 #[derive(Debug, Default)]
 pub struct ResponsesStreamProgress {
-    /// Set once a `response.output_item.done` has become an `OutputItemDone` event for an
-    /// item that core records in the conversation history (`is_recorded_in_history`). Core
-    /// also runs such an item if it is a tool call.
-    recorded_item_done: bool,
+    /// Set once a `response.output_item.done` has become an `OutputItemDone` event for a
+    /// tool call that core runs (`is_tool_call_core_runs`) and that the upstream did not
+    /// finalize with status "incomplete". Core records such a call and its output, which the
+    /// turn's next request hands the model.
+    tool_call_done: bool,
 }
 
-/// Instafy: whether core records `item` in the conversation history, which the turn's retry
-/// rebuilds its request from. This mirrors `is_api_message` in core's context manager, which
-/// drops the rest: an item of a type this client does not know, which parses as `Other`, a
-/// compaction trigger, and a system message. A retry after only such items sends the same
-/// request again.
-fn is_recorded_in_history(item: &ResponseItem) -> bool {
+/// Instafy: whether core runs `item` as a tool call when it completes, and so records an
+/// output for it that gives the turn's next request new model input. The list comes from
+/// `handle_output_item_done` in core/src/stream_events_utils.rs: these are the items it sets
+/// `needs_follow_up` for, the ones `ToolRouter::build_tool_call` in core/src/tools/router.rs
+/// turns into a call or answers with `RespondToModel`. Keep the two in step.
+///
+/// Every other item does not count, even one core records in the history. A reasoning item
+/// or an assistant message is only the model's own output: a retry after it sends the same
+/// input plus that output, under the same cap, and would most likely end the same way. The
+/// managed models are reasoning models and complete a reasoning item before every answer.
+fn is_tool_call_core_runs(item: &ResponseItem) -> bool {
     match item {
-        ResponseItem::Message { role, .. } => role.as_str() != "system",
+        ResponseItem::FunctionCall { .. } | ResponseItem::CustomToolCall { .. } => true,
+        // `build_tool_call` returns `Ok(None)` for a tool search the server ran.
+        ResponseItem::ToolSearchCall {
+            call_id, execution, ..
+        } => call_id.is_some() && execution == "client",
+        // `build_tool_call` returns `Ok(None)` for these, including a local shell call.
         ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Message { .. }
         | ResponseItem::AgentMessage { .. }
-        | ResponseItem::FunctionCallOutput { .. }
-        | ResponseItem::FunctionCall { .. }
-        | ResponseItem::ToolSearchCall { .. }
-        | ResponseItem::ToolSearchOutput { .. }
-        | ResponseItem::CustomToolCall { .. }
-        | ResponseItem::CustomToolCallOutput { .. }
-        | ResponseItem::LocalShellCall { .. }
         | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
-        | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => false,
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => false,
     }
+}
+
+/// Instafy: whether the upstream finalized an output item as cut short. The parsed
+/// `ResponseItem` drops the status of most item types, so this reads the raw item.
+fn is_finalized_incomplete(item: &Value) -> bool {
+    item.get("status").and_then(Value::as_str) == Some("incomplete")
 }
 
 #[derive(Debug)]
@@ -369,9 +385,12 @@ pub fn process_responses_event(
     match event.kind.as_str() {
         "response.output_item.done" => {
             if let Some(item_val) = event.item {
+                // Instafy: a tool call the upstream finalized as incomplete was cut off by the
+                // same stop, so its arguments are truncated and it is not a finished call.
+                let finalized_incomplete = is_finalized_incomplete(&item_val);
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
-                    if is_recorded_in_history(&item) {
-                        progress.recorded_item_done = true;
+                    if is_tool_call_core_runs(&item) && !finalized_incomplete {
+                        progress.tool_call_done = true;
                     }
                     return Ok(Some(ResponseEvent::OutputItemDone(item)));
                 }
@@ -464,21 +483,22 @@ pub fn process_responses_event(
         }
         "response.incomplete" => {
             // Instafy: an incomplete response has already been produced, and billed, upstream.
-            // What a retry sends depends on whether an output item that core records in the
-            // conversation history (`is_recorded_in_history`) completed before it.
+            // What a retry sends depends on whether a tool call that core runs
+            // (`is_tool_call_core_runs`) completed before it.
             //
-            // If none did, the history is unchanged and a retry sends the same request again,
-            // which a max_output_tokens cap or a content_filter stop would most likely end the
-            // same way, billed again. Every reason, including a missing or unknown one, is then
-            // an InvalidRequest, which is not retryable: the turn ends with this message
-            // instead of spending the stream retry budget. That includes a response whose only
-            // completed items are ones core drops, such as an item of an unknown type.
+            // If none did, a retry sends the same input again, at most with the model's own
+            // completed output, such as a reasoning item, appended, under the same cap. A
+            // max_output_tokens cap or a content_filter stop would most likely end it the same
+            // way, billed again. The managed models complete a reasoning item before every
+            // answer, so that is the usual case when the cap cuts an answer off. Every reason,
+            // including a missing or unknown one, is then an InvalidRequest, which is not
+            // retryable: the turn ends with this message instead of spending the stream retry
+            // budget. A tool call the upstream finalized as incomplete does not count.
             //
-            // If one did, core has recorded it, and has run it and recorded its output if it is
-            // a tool call, before the turn's retry loop sees this error. That retry rebuilds its
-            // request from the history, so it continues from the completed items and hands the
-            // model their tool outputs, like any follow-up request. It stays the upstream
-            // retryable stream error.
+            // If one did, core has recorded the call, run it and recorded its output before
+            // the turn's retry loop sees this error. That retry rebuilds its request from the
+            // history, so it hands the model the tool output, like any follow-up request, and
+            // continues. It stays the upstream retryable stream error.
             //
             // The websocket transport parses its events here too. Compaction re-sends the same
             // request on any retry, so it recognizes both errors by their message prefix
@@ -491,7 +511,7 @@ pub fn process_responses_event(
             });
             let reason = reason.unwrap_or("unknown");
             let message = format!("{INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX} {reason}");
-            if progress.recorded_item_done {
+            if progress.tool_call_done {
                 return Err(ResponsesEventError::Api(ApiError::Stream(message)));
             }
             return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
@@ -583,9 +603,9 @@ async fn process_sse_with_treatment(
                 // transport error or an idle timeout after that event reports it, as a clean
                 // close does, instead of a retryable stream error that would send the request
                 // again. The stream error is only for a stream that ends before such an event.
-                // An incomplete response that followed a completed output item that core
-                // records is itself a retryable stream error (see `process_responses_event`),
-                // so it still continues.
+                // An incomplete response that followed a completed tool call that core runs is
+                // itself a retryable stream error (see `process_responses_event`), so it still
+                // continues.
                 let error = response_error.unwrap_or_else(|| ApiError::Stream(e.to_string()));
                 let _ = tx_event.send(Err(error)).await;
                 return;
@@ -1476,9 +1496,13 @@ mod tests {
         })
     }
 
+    fn output_item_done(item: serde_json::Value) -> serde_json::Value {
+        json!({ "type": "response.output_item.done", "item": item })
+    }
+
     /// Checks that `error` is the upstream retryable stream error for an incomplete response
-    /// that followed a completed output item, and that compaction still recognizes it: a
-    /// compaction retry sends the same request again whether or not an item completed.
+    /// that followed a completed tool call, and that compaction still recognizes it: a
+    /// compaction retry sends the same request again whether or not a call completed.
     fn assert_incomplete_continuation_error(error: ApiError, expected_message: &str) {
         assert_matches!(&error, ApiError::Stream(message) if message == expected_message);
         let error = crate::api_bridge::map_api_error(error);
@@ -1489,23 +1513,119 @@ mod tests {
         );
     }
 
-    /// Core records a completed output item, and runs it if it is a tool call, before the
+    /// Core records a completed tool call, runs it and records its output before the
     /// incomplete response ends the request. The turn's retry rebuilds its request from that
     /// history, so it continues with the tool output instead of repeating the request, and
-    /// must stay the retryable stream error on both transports.
+    /// must stay the retryable stream error on both transports. These are the items core's
+    /// `handle_output_item_done` sets `needs_follow_up` for.
     #[tokio::test]
-    async fn incomplete_after_a_completed_output_item_is_retryable() {
-        let errors = errors_after(&[
+    async fn incomplete_after_a_completed_tool_call_is_retryable() {
+        for tool_call in [
             function_call_done_event(),
-            incomplete_event(json!({ "reason": "max_output_tokens" })),
-        ])
-        .await;
+            output_item_done(json!({
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_completed",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo completed\"}"
+            })),
+            output_item_done(json!({
+                "type": "custom_tool_call",
+                "call_id": "call_custom",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            })),
+            output_item_done(json!({
+                "type": "tool_search_call",
+                "call_id": "search_client",
+                "execution": "client",
+                "arguments": { "query": "calendar create", "limit": 1 }
+            })),
+        ] {
+            let errors = errors_after(&[
+                tool_call.clone(),
+                incomplete_event(json!({ "reason": "max_output_tokens" })),
+            ])
+            .await;
 
-        for error in errors {
-            assert_incomplete_continuation_error(
-                error,
-                "Incomplete response returned, reason: max_output_tokens",
-            );
+            for error in errors {
+                assert_incomplete_continuation_error(
+                    error,
+                    "Incomplete response returned, reason: max_output_tokens",
+                );
+            }
+        }
+    }
+
+    /// The managed models are reasoning models: every response completes a reasoning item
+    /// before the answer, so a cap or a filter that cuts the answer off always follows one.
+    /// A retry sends the same input plus that reasoning under the same cap, with no tool
+    /// output, and would most likely end the same way, billed again.
+    #[tokio::test]
+    async fn incomplete_after_reasoning_and_a_partial_message_is_not_retryable() {
+        for reason in ["max_output_tokens", "content_filter"] {
+            let errors = errors_after(&[
+                output_item_done(json!({
+                    "type": "reasoning",
+                    "id": "rs_before_cap",
+                    "summary": [{ "type": "summary_text", "text": "planning the answer" }],
+                    "encrypted_content": "b".repeat(550)
+                })),
+                json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "partial" }]
+                    }
+                }),
+                json!({ "type": "response.output_text.delta", "delta": " content" }),
+                incomplete_event(json!({ "reason": reason })),
+            ])
+            .await;
+
+            for error in errors {
+                assert_incomplete_error(
+                    error,
+                    &format!("Incomplete response returned, reason: {reason}"),
+                );
+            }
+        }
+    }
+
+    /// A tool call the upstream finalized as incomplete was cut off by the same stop, so its
+    /// arguments are truncated. It is not a finished call and must not make the incomplete
+    /// response retryable.
+    #[tokio::test]
+    async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_not_retryable() {
+        for tool_call in [
+            json!({
+                "type": "function_call",
+                "status": "incomplete",
+                "call_id": "call_cut_off",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo cut"
+            }),
+            json!({
+                "type": "custom_tool_call",
+                "status": "incomplete",
+                "call_id": "call_custom_cut_off",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: a"
+            }),
+        ] {
+            let errors = errors_after(&[
+                output_item_done(tool_call),
+                incomplete_event(json!({ "reason": "max_output_tokens" })),
+            ])
+            .await;
+
+            for error in errors {
+                assert_incomplete_error(
+                    error,
+                    "Incomplete response returned, reason: max_output_tokens",
+                );
+            }
         }
     }
 
@@ -1535,12 +1655,14 @@ mod tests {
         }
     }
 
-    /// Completed output items that core drops instead of recording in the conversation
-    /// history: an item of a type this client does not know, which parses as `Other`, a
-    /// compaction trigger, and a system message. The turn's retry rebuilds its request from
-    /// that unchanged history, so it would send the same request again.
+    /// Completed output items that core does not run as tool calls. Core records some of
+    /// them in the history, but none gives the turn's retry a tool output: it would send the
+    /// same input plus the model's own output under the same cap. That covers a finished
+    /// assistant message, server-side tools that already ran upstream, a local shell call,
+    /// which core no longer runs, and items core drops: an item of a type this client does
+    /// not know, which parses as `Other`, a compaction trigger, and a system message.
     #[tokio::test]
-    async fn incomplete_after_only_unrecorded_output_items_is_not_retryable() {
+    async fn incomplete_after_only_completed_non_tool_call_items_is_not_retryable() {
         let unknown_item = json!({
             "type": "mcp_list_tools",
             "id": "mcpl_before_cap",
@@ -1553,6 +1675,42 @@ mod tests {
         );
 
         for item in [
+            json!({
+                "type": "reasoning",
+                "id": "rs_before_cap",
+                "summary": [],
+                "encrypted_content": null
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "finished commentary" }]
+            }),
+            json!({
+                "type": "web_search_call",
+                "id": "ws_before_cap",
+                "status": "completed",
+                "action": { "type": "search", "query": "weather" }
+            }),
+            json!({
+                "type": "image_generation_call",
+                "id": "ig_before_cap",
+                "status": "completed",
+                "revised_prompt": "a cat",
+                "result": "aGVsbG8="
+            }),
+            json!({
+                "type": "tool_search_call",
+                "call_id": "search_server",
+                "execution": "server",
+                "arguments": { "query": "calendar create" }
+            }),
+            json!({
+                "type": "local_shell_call",
+                "call_id": "shell_before_cap",
+                "status": "completed",
+                "action": { "type": "exec", "command": ["echo", "hi"] }
+            }),
             unknown_item,
             json!({ "type": "compaction_trigger" }),
             json!({
@@ -1562,7 +1720,7 @@ mod tests {
             }),
         ] {
             let errors = errors_after(&[
-                json!({ "type": "response.output_item.done", "item": item }),
+                output_item_done(item),
                 incomplete_event(json!({ "reason": "max_output_tokens" })),
             ])
             .await;
@@ -1577,9 +1735,9 @@ mod tests {
     }
 
     /// A late transport error keeps the stored incomplete error, which after a completed
-    /// output item is the retryable one, so the turn still continues.
+    /// tool call is the retryable one, so the turn still continues.
     #[tokio::test]
-    async fn completed_item_then_incomplete_then_transport_error_is_retryable() {
+    async fn completed_tool_call_then_incomplete_then_transport_error_is_retryable() {
         let stream = stream::iter(vec![
             Ok(Bytes::from(format!(
                 "event: response.output_item.done\ndata: {}\n\n",
