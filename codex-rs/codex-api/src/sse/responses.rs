@@ -318,9 +318,9 @@ fn json_value_as_string(value: &Value) -> Option<String> {
 #[derive(Debug, Default)]
 pub struct ResponsesStreamProgress {
     /// Set once a `response.output_item.done` has become an `OutputItemDone` event for a
-    /// tool call that core runs (`is_tool_call_core_runs`) and that the upstream did not
-    /// finalize with status "incomplete". Core records such a call and its output, which the
-    /// turn's next request hands the model.
+    /// tool call that core runs (`is_tool_call_core_runs`). Core records such a call and its
+    /// output, which the turn's next request hands the model. A call the upstream finalized
+    /// with status "incomplete" never becomes that event.
     tool_call_done: bool,
 }
 
@@ -385,11 +385,21 @@ pub fn process_responses_event(
     match event.kind.as_str() {
         "response.output_item.done" => {
             if let Some(item_val) = event.item {
-                // Instafy: a tool call the upstream finalized as incomplete was cut off by the
-                // same stop, so its arguments are truncated and it is not a finished call.
                 let finalized_incomplete = is_finalized_incomplete(&item_val);
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
-                    if is_tool_call_core_runs(&item) && !finalized_incomplete {
+                    if is_tool_call_core_runs(&item) {
+                        // Instafy: a tool call the upstream finalized as incomplete was cut off
+                        // by the stop that ends this response, so its arguments are truncated.
+                        // Core runs every call it receives, and the response then ends with the
+                        // incomplete error, so the call could have side effects and its output
+                        // would never reach the model. It is not passed on: core neither records
+                        // nor runs it, and the history never holds a call without its output.
+                        // Only its streaming events, such as an apply_patch preview, reach core,
+                        // as for a stream that ends before a call is done.
+                        if finalized_incomplete {
+                            debug!("dropping a tool call the upstream finalized as incomplete");
+                            return Ok(None);
+                        }
                         progress.tool_call_done = true;
                     }
                     return Ok(Some(ResponseEvent::OutputItemDone(item)));
@@ -493,7 +503,8 @@ pub fn process_responses_event(
             // answer, so that is the usual case when the cap cuts an answer off. Every reason,
             // including a missing or unknown one, is then an InvalidRequest, which is not
             // retryable: the turn ends with this message instead of spending the stream retry
-            // budget. A tool call the upstream finalized as incomplete does not count.
+            // budget. A tool call the upstream finalized as incomplete does not count: it is not
+            // passed on, so core never runs it (see "response.output_item.done").
             //
             // If one did, core has recorded the call, run it and recorded its output before
             // the turn's retry loop sees this error. That retry rebuilds its request from the
@@ -1257,9 +1268,9 @@ mod tests {
 
     /// Runs `events`, one response, through the SSE stream and through
     /// `process_responses_event` with one `ResponsesStreamProgress`, as the websocket
-    /// transport does for each request. Checks that both paths pass every event before the
-    /// last one through, and returns the error each path ends the request with.
-    async fn errors_after(events: &[serde_json::Value]) -> [ApiError; 2] {
+    /// transport does for each request. Returns, for each path, the events it passed on
+    /// before the last one and the error it ended the request with.
+    async fn outcomes_after(events: &[serde_json::Value]) -> [(Vec<ResponseEvent>, ApiError); 2] {
         let body = events
             .iter()
             .map(|event| {
@@ -1272,8 +1283,10 @@ mod tests {
             Some(Err(error)) => error,
             other => panic!("expected the SSE stream to end with an error, got {other:?}"),
         };
-        assert_eq!(sse_events.len(), events.len() - 1, "{sse_events:?}");
-        assert!(sse_events.iter().all(Result::is_ok), "{sse_events:?}");
+        let sse_events = sse_events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("SSE error before the last event: {error:?}"));
 
         let mut progress = ResponsesStreamProgress::default();
         let mut websocket_results = events
@@ -1288,14 +1301,25 @@ mod tests {
             Some(Err(error)) => error.into_api_error(),
             other => panic!("expected an error from the websocket path, got {other:?}"),
         };
-        assert!(
-            websocket_results
-                .iter()
-                .all(|result| matches!(result, Ok(Some(_)))),
-            "{websocket_results:?}"
-        );
+        let websocket_events = websocket_results
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(event) => event,
+                Err(error) => panic!("websocket error before the last event: {error:?}"),
+            })
+            .collect();
 
-        [sse_error, websocket_error]
+        [(sse_events, sse_error), (websocket_events, websocket_error)]
+    }
+
+    /// Runs `events` through both paths as `outcomes_after` does, checks that both pass
+    /// every event before the last one on, and returns the error each path ends the request
+    /// with.
+    async fn errors_after(events: &[serde_json::Value]) -> [ApiError; 2] {
+        outcomes_after(events).await.map(|(passed_on, error)| {
+            assert_eq!(passed_on.len(), events.len() - 1, "{passed_on:?}");
+            error
+        })
     }
 
     /// Checks that `event` ends the request with an `InvalidRequest` carrying
@@ -1594,10 +1618,13 @@ mod tests {
     }
 
     /// A tool call the upstream finalized as incomplete was cut off by the same stop, so its
-    /// arguments are truncated. It is not a finished call and must not make the incomplete
-    /// response retryable.
+    /// arguments are truncated. Core runs every call it receives, and the response ends with
+    /// the incomplete error, so the call could have side effects and its output would never
+    /// reach the model. Neither transport passes it on, and it must not make the incomplete
+    /// response retryable. The event that started it still passes, as for a stream that ends
+    /// before a call is done.
     #[tokio::test]
-    async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_not_retryable() {
+    async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_not_passed_on_or_retryable() {
         for tool_call in [
             json!({
                 "type": "function_call",
@@ -1613,19 +1640,93 @@ mod tests {
                 "name": "apply_patch",
                 "input": "*** Begin Patch\n*** Add File: a"
             }),
+            json!({
+                "type": "tool_search_call",
+                "status": "incomplete",
+                "call_id": "search_cut_off",
+                "execution": "client",
+                "arguments": { "query": "calendar" }
+            }),
         ] {
-            let errors = errors_after(&[
-                output_item_done(tool_call),
+            let mut started = tool_call.clone();
+            started["status"] = json!("in_progress");
+            let outcomes = outcomes_after(&[
+                json!({ "type": "response.output_item.added", "item": started }),
+                output_item_done(tool_call.clone()),
                 incomplete_event(json!({ "reason": "max_output_tokens" })),
             ])
             .await;
 
-            for error in errors {
+            for (passed_on, error) in outcomes {
+                assert_matches!(
+                    passed_on.as_slice(),
+                    [ResponseEvent::OutputItemAdded(_)],
+                    "{tool_call}"
+                );
                 assert_incomplete_error(
                     error,
                     "Incomplete response returned, reason: max_output_tokens",
                 );
             }
+        }
+    }
+
+    /// Parallel tool calls where the first completes and the stop cuts the second off. Only
+    /// the finished call is passed on, so core runs it and its retry continues with that
+    /// output, and neither runs the cut-off call nor records it without an output.
+    #[tokio::test]
+    async fn incomplete_after_a_finished_and_a_cut_off_tool_call_passes_on_only_the_finished_one() {
+        let outcomes = outcomes_after(&[
+            function_call_done_event(),
+            output_item_done(json!({
+                "type": "function_call",
+                "status": "incomplete",
+                "call_id": "call_cut_off",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo cut\"}"
+            })),
+            incomplete_event(json!({ "reason": "max_output_tokens" })),
+        ])
+        .await;
+
+        for (passed_on, error) in outcomes {
+            assert_matches!(
+                passed_on.as_slice(),
+                [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. })]
+                    if call_id == "call_before_cap"
+            );
+            assert_incomplete_continuation_error(
+                error,
+                "Incomplete response returned, reason: max_output_tokens",
+            );
+        }
+    }
+
+    /// Only tool calls are held back. A message the stop cut off is still passed on, as
+    /// before, so core shows and records the partial answer.
+    #[tokio::test]
+    async fn incomplete_after_a_message_finalized_as_incomplete_still_passes_it_on() {
+        let outcomes = outcomes_after(&[
+            output_item_done(json!({
+                "type": "message",
+                "role": "assistant",
+                "status": "incomplete",
+                "content": [{ "type": "output_text", "text": "partial answer" }]
+            })),
+            incomplete_event(json!({ "reason": "max_output_tokens" })),
+        ])
+        .await;
+
+        for (passed_on, error) in outcomes {
+            assert_matches!(
+                passed_on.as_slice(),
+                [ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. })]
+                    if role == "assistant"
+            );
+            assert_incomplete_error(
+                error,
+                "Incomplete response returned, reason: max_output_tokens",
+            );
         }
     }
 

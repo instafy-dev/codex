@@ -294,7 +294,8 @@ pub(crate) async fn handle_output_item_done(
 
     // Instafy: `is_tool_call_core_runs` in codex-api/src/sse/responses.rs lists the items
     // this sets `needs_follow_up` for, to decide whether an incomplete response may be
-    // retried. Keep the two in step.
+    // retried and to hold back a call the upstream finalized as incomplete, which this would
+    // otherwise run. Keep the two in step.
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {

@@ -10,8 +10,9 @@
 //! Once a tool call has completed, the turn has recorded it and run it, and its retry
 //! rebuilds the request from that history: it continues with the tool output, as any
 //! follow-up does, and must still be sent. A tool call the upstream finalized as incomplete
-//! was cut off by the same stop and does not count. Compaction retries send the same request
-//! either way, so a compaction is requested once in both cases.
+//! was cut off by the same stop: the turn never runs or records it, and it does not count.
+//! Compaction retries send the same request either way, so a compaction is requested once in
+//! both cases.
 
 use anyhow::Result;
 use codex_login::CodexAuth;
@@ -141,8 +142,15 @@ fn finished_tool_call() -> Value {
     ev_shell_command_call("call_finished", "echo finished")
 }
 
-/// A tool call that the upstream finalized as incomplete: the stop cut its arguments off.
+/// The file that the command of `tool_call_finalized_as_incomplete` creates in the turn's
+/// working directory, so a test can see whether the turn ran it.
+const CUT_OFF_CALL_MARKER: &str = "cut_off_call_ran";
+
+/// A tool call that the upstream finalized as incomplete: the stop cut it off. Its arguments
+/// are usually truncated, but a stop can also fall where they still parse, as here, so a
+/// turn that ran the call would run its command.
 fn tool_call_finalized_as_incomplete() -> Vec<Value> {
+    let arguments = json!({ "command": format!("touch {CUT_OFF_CALL_MARKER}") }).to_string();
     vec![
         json!({
             "type": "response.output_item.added",
@@ -161,10 +169,18 @@ fn tool_call_finalized_as_incomplete() -> Vec<Value> {
                 "status": "incomplete",
                 "call_id": "call_cut_off",
                 "name": "shell_command",
-                "arguments": "{\"command\":\"echo cut"
+                "arguments": arguments
             }
         }),
     ]
+}
+
+/// Checks that the command of a tool call the upstream finalized as incomplete never ran.
+fn assert_cut_off_call_never_ran(test: &TestCodex) {
+    assert!(
+        !test.cwd_path().join(CUT_OFF_CALL_MARKER).exists(),
+        "a tool call the upstream finalized as incomplete must never run"
+    );
 }
 
 /// The JSON body of every request that reached the Responses endpoint, in order.
@@ -277,6 +293,8 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
 
 /// Runs a turn whose response streams `output`, which holds no finished tool call, and then
 /// stops for `reason`, and checks that it is requested once and ends the turn with its reason.
+/// The turn runs tool calls without approval or a sandbox, so a cut-off call it ran would take
+/// effect, and the check that it never ran would see it.
 async fn assert_incomplete_response_is_requested_once(
     output: Vec<Value>,
     reason: &str,
@@ -294,10 +312,11 @@ async fn assert_incomplete_response_is_requested_once(
         .await?;
 
     test.codex
-        .submit(user_turn("trigger incomplete", /*model*/ None))
+        .submit(tool_turn(&test, "trigger incomplete"))
         .await?;
     let (stream_errors, mut errors, completed) = turn_errors(&test.codex).await;
 
+    assert_cut_off_call_never_ran(&test);
     assert_eq!(
         responses_request_bodies(&server).await.len(),
         1,
@@ -341,10 +360,11 @@ async fn assert_incomplete_response_is_requested_once_over_websocket(
     let test = builder.build_with_websocket_server(&server).await?;
 
     test.codex
-        .submit(user_turn("trigger incomplete", /*model*/ None))
+        .submit(tool_turn(&test, "trigger incomplete"))
         .await?;
     let (stream_errors, errors, completed) = turn_errors(&test.codex).await;
 
+    assert_cut_off_call_never_ran(&test);
     assert_eq!(
         server
             .connections()
@@ -409,10 +429,12 @@ async fn incomplete_after_reasoning_and_a_partial_message_is_requested_once_over
 }
 
 /// A tool call the upstream finalized as incomplete was cut off by the same stop, so its
-/// arguments are truncated. It is not a finished call whose output the model could continue
-/// from, and the response must not be sent again.
+/// arguments are usually truncated. It is not a finished call whose output the model could
+/// continue from, and the response must not be sent again. The turn must not run it either:
+/// the turn then ends with the incomplete error, so the call could have side effects and its
+/// output would never reach the model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_requested_once() -> Result<()> {
+async fn incomplete_after_a_tool_call_finalized_as_incomplete_never_runs_it() -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_response_is_requested_once(
         tool_call_finalized_as_incomplete(),
@@ -422,7 +444,7 @@ async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_requested_once(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incomplete_after_a_tool_call_finalized_as_incomplete_is_requested_once_over_websocket()
+async fn incomplete_after_a_tool_call_finalized_as_incomplete_never_runs_it_over_websocket()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
     assert_incomplete_response_is_requested_once_over_websocket(
@@ -536,6 +558,78 @@ async fn incomplete_after_a_finished_tool_call_continues_with_its_output() -> Re
         vec![Some(
             "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens"
         )]
+    );
+    assert_eq!(errors, Vec::new());
+    assert_eq!(completed.error, None);
+
+    Ok(())
+}
+
+/// The same parallel calls, with the second one finalized as incomplete. The turn runs the
+/// finished call and continues with its output, but must never run the cut-off one, and the
+/// continuation must carry nothing of it: a call without its output would break the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_after_a_finished_tool_call_never_runs_the_one_finalized_as_incomplete()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let call_id = "call_finished";
+    let mut capped = vec![
+        ev_response_created("resp_capped"),
+        ev_shell_command_call(call_id, "echo ran before the cap"),
+    ];
+    capped.extend(tool_call_finalized_as_incomplete());
+    capped.push(ev_incomplete("max_output_tokens"));
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(capped),
+            sse(vec![
+                ev_response_created("resp_continued"),
+                ev_assistant_message("msg_continued", "done"),
+                ev_completed("resp_continued"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(5);
+        })
+        .build(&server)
+        .await?;
+
+    test.codex
+        .submit(tool_turn(&test, "run two commands"))
+        .await?;
+    let (_, errors, completed) = turn_errors(&test.codex).await;
+
+    assert_cut_off_call_never_ran(&test);
+    let requests = responses.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the turn must continue after the incomplete response"
+    );
+    let output = requests[1]
+        .function_call_output_text(call_id)
+        .expect("the continuation must carry the output of the call that ran");
+    assert!(
+        output.contains("ran before the cap"),
+        "tool output: {output}"
+    );
+    let call_ids = requests[1]
+        .input()
+        .iter()
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_ids,
+        vec![call_id, call_id],
+        "the continuation carries the finished call and its output, not the cut-off call"
     );
     assert_eq!(errors, Vec::new());
     assert_eq!(completed.error, None);
