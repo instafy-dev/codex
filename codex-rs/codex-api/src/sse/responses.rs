@@ -312,6 +312,43 @@ fn json_value_as_string(value: &Value) -> Option<String> {
     }
 }
 
+/// Instafy: what one response stream has produced before its current event. The SSE
+/// reader and the websocket transport keep one per request and pass it to
+/// `process_responses_event` with every event of that request.
+#[derive(Debug, Default)]
+pub struct ResponsesStreamProgress {
+    /// Set once a `response.output_item.done` has become an `OutputItemDone` event for an
+    /// item that core records in the conversation history (`is_recorded_in_history`). Core
+    /// also runs such an item if it is a tool call.
+    recorded_item_done: bool,
+}
+
+/// Instafy: whether core records `item` in the conversation history, which the turn's retry
+/// rebuilds its request from. This mirrors `is_api_message` in core's context manager, which
+/// drops the rest: an item of a type this client does not know, which parses as `Other`, a
+/// compaction trigger, and a system message. A retry after only such items sends the same
+/// request again.
+fn is_recorded_in_history(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role.as_str() != "system",
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => false,
+    }
+}
+
 #[derive(Debug)]
 pub enum ResponsesEventError {
     Api(ApiError),
@@ -327,11 +364,15 @@ impl ResponsesEventError {
 
 pub fn process_responses_event(
     event: ResponsesStreamEvent,
+    progress: &mut ResponsesStreamProgress,
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "response.output_item.done" => {
             if let Some(item_val) = event.item {
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+                    if is_recorded_in_history(&item) {
+                        progress.recorded_item_done = true;
+                    }
                     return Ok(Some(ResponseEvent::OutputItemDone(item)));
                 }
                 debug!("failed to parse ResponseItem from output_item.done");
@@ -423,13 +464,25 @@ pub fn process_responses_event(
         }
         "response.incomplete" => {
             // Instafy: an incomplete response has already been produced, and billed, upstream.
-            // A retry sends the whole request again, and a max_output_tokens cap or a
-            // content_filter stop would most likely end the same way and be billed again.
-            // Every reason, including a missing or unknown one, is therefore an InvalidRequest,
-            // which is not retryable: the turn ends with this message instead of spending the
-            // stream retry budget. The websocket transport parses its events here too.
-            // Compaction, which re-sends some InvalidRequests, recognizes this one by its
-            // message prefix (`is_instafy_incomplete_response`).
+            // What a retry sends depends on whether an output item that core records in the
+            // conversation history (`is_recorded_in_history`) completed before it.
+            //
+            // If none did, the history is unchanged and a retry sends the same request again,
+            // which a max_output_tokens cap or a content_filter stop would most likely end the
+            // same way, billed again. Every reason, including a missing or unknown one, is then
+            // an InvalidRequest, which is not retryable: the turn ends with this message
+            // instead of spending the stream retry budget. That includes a response whose only
+            // completed items are ones core drops, such as an item of an unknown type.
+            //
+            // If one did, core has recorded it, and has run it and recorded its output if it is
+            // a tool call, before the turn's retry loop sees this error. That retry rebuilds its
+            // request from the history, so it continues from the completed items and hands the
+            // model their tool outputs, like any follow-up request. It stays the upstream
+            // retryable stream error.
+            //
+            // The websocket transport parses its events here too. Compaction re-sends the same
+            // request on any retry, so it recognizes both errors by their message prefix
+            // (`is_instafy_incomplete_response`) and does not retry either.
             let reason = event.response.as_ref().and_then(|response| {
                 response
                     .get("incomplete_details")
@@ -438,6 +491,9 @@ pub fn process_responses_event(
             });
             let reason = reason.unwrap_or("unknown");
             let message = format!("{INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX} {reason}");
+            if progress.recorded_item_done {
+                return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+            }
             return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
                 message,
             }));
@@ -510,6 +566,7 @@ async fn process_sse_with_treatment(
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
+    let mut progress = ResponsesStreamProgress::default();
 
     loop {
         let start = Instant::now();
@@ -526,6 +583,9 @@ async fn process_sse_with_treatment(
                 // transport error or an idle timeout after that event reports it, as a clean
                 // close does, instead of a retryable stream error that would send the request
                 // again. The stream error is only for a stream that ends before such an event.
+                // An incomplete response that followed a completed output item that core
+                // records is itself a retryable stream error (see `process_responses_event`),
+                // so it still continues.
                 let error = response_error.unwrap_or_else(|| ApiError::Stream(e.to_string()));
                 let _ = tx_event.send(Err(error)).await;
                 return;
@@ -596,7 +656,7 @@ async fn process_sse_with_treatment(
             return;
         }
 
-        match process_responses_event(event) {
+        match process_responses_event(event, &mut progress) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
                 if tx_event.send(Ok(event)).await.is_err() {
@@ -1175,26 +1235,55 @@ mod tests {
         })
     }
 
+    /// Runs `events`, one response, through the SSE stream and through
+    /// `process_responses_event` with one `ResponsesStreamProgress`, as the websocket
+    /// transport does for each request. Checks that both paths pass every event before the
+    /// last one through, and returns the error each path ends the request with.
+    async fn errors_after(events: &[serde_json::Value]) -> [ApiError; 2] {
+        let body = events
+            .iter()
+            .map(|event| {
+                let kind = event["type"].as_str().expect("fixture event missing type");
+                format!("event: {kind}\ndata: {event}\n\n")
+            })
+            .collect::<String>();
+        let mut sse_events = collect_events(&[body.as_bytes()]).await;
+        let sse_error = match sse_events.pop() {
+            Some(Err(error)) => error,
+            other => panic!("expected the SSE stream to end with an error, got {other:?}"),
+        };
+        assert_eq!(sse_events.len(), events.len() - 1, "{sse_events:?}");
+        assert!(sse_events.iter().all(Result::is_ok), "{sse_events:?}");
+
+        let mut progress = ResponsesStreamProgress::default();
+        let mut websocket_results = events
+            .iter()
+            .map(|event| {
+                let event: ResponsesStreamEvent =
+                    serde_json::from_value(event.clone()).expect("fixture event should parse");
+                process_responses_event(event, &mut progress)
+            })
+            .collect::<Vec<_>>();
+        let websocket_error = match websocket_results.pop() {
+            Some(Err(error)) => error.into_api_error(),
+            other => panic!("expected an error from the websocket path, got {other:?}"),
+        };
+        assert!(
+            websocket_results
+                .iter()
+                .all(|result| matches!(result, Ok(Some(_)))),
+            "{websocket_results:?}"
+        );
+
+        [sse_error, websocket_error]
+    }
+
     /// Checks that `event` ends the request with an `InvalidRequest` carrying
     /// `expected_message`, both from the SSE stream and from `process_responses_event`, which
     /// the websocket transport calls for each event. A `Stream` error would be retried, and a
     /// retry sends, and bills, the whole request again.
     async fn assert_incomplete_is_not_retryable(event: serde_json::Value, expected_message: &str) {
-        let sse = format!("event: response.incomplete\ndata: {event}\n\n");
-        let mut events = collect_events(&[sse.as_bytes()]).await;
-        assert_eq!(events.len(), 1);
-        let sse_error = match events.remove(0) {
-            Err(error) => error,
-            Ok(event) => panic!("expected an error from the SSE stream, got {event:?}"),
-        };
-        let event: ResponsesStreamEvent =
-            serde_json::from_value(event).expect("incomplete event should parse");
-        let websocket_error = match process_responses_event(event) {
-            Err(error) => error.into_api_error(),
-            Ok(event) => panic!("expected an error from the websocket path, got {event:?}"),
-        };
-
-        for error in [sse_error, websocket_error] {
+        for error in errors_after(&[event]).await {
             assert_incomplete_error(error, expected_message);
         }
     }
@@ -1373,6 +1462,145 @@ mod tests {
             "Incomplete response returned, reason: a_future_reason",
         )
         .await;
+    }
+
+    fn function_call_done_event() -> serde_json::Value {
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_before_cap",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo before cap\"}"
+            }
+        })
+    }
+
+    /// Checks that `error` is the upstream retryable stream error for an incomplete response
+    /// that followed a completed output item, and that compaction still recognizes it: a
+    /// compaction retry sends the same request again whether or not an item completed.
+    fn assert_incomplete_continuation_error(error: ApiError, expected_message: &str) {
+        assert_matches!(&error, ApiError::Stream(message) if message == expected_message);
+        let error = crate::api_bridge::map_api_error(error);
+        assert!(error.is_retryable(), "{error:?} must be retryable");
+        assert!(
+            crate::api_bridge::is_instafy_incomplete_response(&error),
+            "compaction must recognize {error:?} as an incomplete response"
+        );
+    }
+
+    /// Core records a completed output item, and runs it if it is a tool call, before the
+    /// incomplete response ends the request. The turn's retry rebuilds its request from that
+    /// history, so it continues with the tool output instead of repeating the request, and
+    /// must stay the retryable stream error on both transports.
+    #[tokio::test]
+    async fn incomplete_after_a_completed_output_item_is_retryable() {
+        let errors = errors_after(&[
+            function_call_done_event(),
+            incomplete_event(json!({ "reason": "max_output_tokens" })),
+        ])
+        .await;
+
+        for error in errors {
+            assert_incomplete_continuation_error(
+                error,
+                "Incomplete response returned, reason: max_output_tokens",
+            );
+        }
+    }
+
+    /// An item that has only started streaming is not recorded anywhere, so a retry would
+    /// send the same request again.
+    #[tokio::test]
+    async fn incomplete_after_an_unfinished_output_item_is_not_retryable() {
+        let errors = errors_after(&[
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "partial" }]
+                }
+            }),
+            json!({ "type": "response.output_text.delta", "delta": " content" }),
+            incomplete_event(json!({ "reason": "max_output_tokens" })),
+        ])
+        .await;
+
+        for error in errors {
+            assert_incomplete_error(
+                error,
+                "Incomplete response returned, reason: max_output_tokens",
+            );
+        }
+    }
+
+    /// Completed output items that core drops instead of recording in the conversation
+    /// history: an item of a type this client does not know, which parses as `Other`, a
+    /// compaction trigger, and a system message. The turn's retry rebuilds its request from
+    /// that unchanged history, so it would send the same request again.
+    #[tokio::test]
+    async fn incomplete_after_only_unrecorded_output_items_is_not_retryable() {
+        let unknown_item = json!({
+            "type": "mcp_list_tools",
+            "id": "mcpl_before_cap",
+            "server_label": "docs",
+            "tools": []
+        });
+        assert_matches!(
+            serde_json::from_value::<ResponseItem>(unknown_item.clone()),
+            Ok(ResponseItem::Other)
+        );
+
+        for item in [
+            unknown_item,
+            json!({ "type": "compaction_trigger" }),
+            json!({
+                "type": "message",
+                "role": "system",
+                "content": [{ "type": "input_text", "text": "system note" }]
+            }),
+        ] {
+            let errors = errors_after(&[
+                json!({ "type": "response.output_item.done", "item": item }),
+                incomplete_event(json!({ "reason": "max_output_tokens" })),
+            ])
+            .await;
+
+            for error in errors {
+                assert_incomplete_error(
+                    error,
+                    "Incomplete response returned, reason: max_output_tokens",
+                );
+            }
+        }
+    }
+
+    /// A late transport error keeps the stored incomplete error, which after a completed
+    /// output item is the retryable one, so the turn still continues.
+    #[tokio::test]
+    async fn completed_item_then_incomplete_then_transport_error_is_retryable() {
+        let stream = stream::iter(vec![
+            Ok(Bytes::from(format!(
+                "event: response.output_item.done\ndata: {}\n\n",
+                function_call_done_event()
+            ))),
+            incomplete_max_output_tokens_sse(),
+            Err(TransportError::Network("connection reset".to_string())),
+        ]);
+
+        let mut events = collect_stream_events(Box::pin(stream), idle_timeout()).await;
+
+        assert_matches!(
+            events.remove(0),
+            Ok(ResponseEvent::OutputItemDone(
+                ResponseItem::FunctionCall { .. }
+            ))
+        );
+        assert_incomplete_continuation_error(
+            single_error(events),
+            "Incomplete response returned, reason: max_output_tokens",
+        );
     }
 
     #[tokio::test]

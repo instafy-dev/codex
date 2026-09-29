@@ -191,9 +191,9 @@ const INSTAFY_RETRYABLE_429_MAX_DELAY: Duration = Duration::from_secs(30);
 // Retry-After and would all retry at the same instant. Waiting up to this much longer,
 // never shorter, spreads them out while still honoring the proxy's floor.
 const INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT: u32 = 20;
-// Starts the message of the InvalidRequest that a `response.incomplete` event ends a
-// request with (sse/responses.rs). `is_instafy_incomplete_response` reads it, so callers
-// that re-send an InvalidRequest anyway can leave this one alone.
+// Starts the message of the error that a `response.incomplete` event ends a request with
+// (sse/responses.rs). `is_instafy_incomplete_response` reads it, so callers that re-send
+// the same request on these errors anyway can leave them alone.
 pub(crate) const INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX: &str =
     "Incomplete response returned, reason:";
 
@@ -267,14 +267,22 @@ fn instafy_retryable_error_message(body: &str) -> Option<String> {
 
 /// Returns true for the error that a `response.incomplete` event ends a request with.
 /// Instafy bills that response once the upstream has produced it, and a max_output_tokens
-/// cap or a content_filter stop would most likely end the same way on the next request.
-/// The error is an InvalidRequest, so the stream retry budget already leaves it alone, but
-/// compaction re-sends some InvalidRequests: on the current model after the previous model
-/// failed, and on any error during local compaction. Those callers check this first.
+/// cap or a content_filter stop would most likely end the same way on the same request.
+///
+/// Before any output item that core records in the conversation history completed, the
+/// error is an InvalidRequest, so the stream retry budget already leaves it alone. After one
+/// completed, it is a retryable stream error, because the turn's retry rebuilds its request
+/// from the history that now holds that item and its tool output, and so continues rather
+/// than repeats.
+///
+/// Compaction sends the same request on every retry, whether or not an item completed: the
+/// remote compaction stream retry, the fallback to the current model after the previous
+/// model failed, and local compaction, which retries any error. Those callers check this
+/// first, so it matches both errors.
 pub fn is_instafy_incomplete_response(error: &CodexErr) -> bool {
     matches!(
         error,
-        CodexErr::InvalidRequest(message)
+        CodexErr::InvalidRequest(message) | CodexErr::Stream(message, None)
             if message.starts_with(INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX)
     )
 }

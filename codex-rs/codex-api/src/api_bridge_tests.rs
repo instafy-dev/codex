@@ -679,10 +679,16 @@ fn map_api_error_keeps_usage_limit_429_terminal_even_when_marked_retryable() {
 }
 
 #[test]
-fn is_instafy_incomplete_response_matches_only_the_incomplete_invalid_request() {
+fn is_instafy_incomplete_response_matches_only_the_incomplete_errors() {
     let message = "Incomplete response returned, reason: content_filter";
+    // The error before any output item completed, and the retryable one after an item did:
+    // compaction re-sends the same request on either.
     assert!(is_instafy_incomplete_response(&CodexErr::InvalidRequest(
         message.to_string()
+    )));
+    assert!(is_instafy_incomplete_response(&CodexErr::Stream(
+        message.to_string(),
+        /*delay*/ None,
     )));
 
     // A rejected request, and any other error that carries the same text, keep their
@@ -698,8 +704,14 @@ fn is_instafy_incomplete_response_matches_only_the_incomplete_invalid_request() 
         "got {rejected:?}"
     );
     assert!(!is_instafy_incomplete_response(&rejected));
+    // Other stream errors, and a failure the server asks to retry after a delay, keep their
+    // retries.
+    assert!(!is_instafy_incomplete_response(&CodexErr::Stream(
+        "stream closed before response.completed".to_string(),
+        /*delay*/ None,
+    )));
     assert!(!is_instafy_incomplete_response(&CodexErr::Stream(
         message.to_string(),
-        /*delay*/ None,
+        Some(Duration::from_secs(1)),
     )));
 }

@@ -6,9 +6,10 @@ use tracing::warn;
 
 /// Retries failures that may be model-specific and succeed with a different model.
 pub(crate) fn should_retry_with_current_model(error: &CodexErr) -> bool {
-    // Instafy: an incomplete response is an InvalidRequest, but the previous model did
-    // produce it, and it has been billed. A capped or filtered compaction costs one request,
-    // so it ends the compaction instead of running it again on the current model.
+    // Instafy: an incomplete response is an InvalidRequest when no output item that core
+    // records completed first, but the previous model did produce it, and it has been billed.
+    // A capped or filtered compaction costs one request, so it ends the compaction instead of
+    // running it again on the current model.
     if codex_api::is_instafy_incomplete_response(error) {
         return false;
     }
