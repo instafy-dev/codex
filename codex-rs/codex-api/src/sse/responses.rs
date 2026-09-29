@@ -1,3 +1,4 @@
+use crate::api_bridge::INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
@@ -421,6 +422,14 @@ pub fn process_responses_event(
             )));
         }
         "response.incomplete" => {
+            // Instafy: an incomplete response has already been produced, and billed, upstream.
+            // A retry sends the whole request again, and a max_output_tokens cap or a
+            // content_filter stop would most likely end the same way and be billed again.
+            // Every reason, including a missing or unknown one, is therefore an InvalidRequest,
+            // which is not retryable: the turn ends with this message instead of spending the
+            // stream retry budget. The websocket transport parses its events here too.
+            // Compaction, which re-sends some InvalidRequests, recognizes this one by its
+            // message prefix (`is_instafy_incomplete_response`).
             let reason = event.response.as_ref().and_then(|response| {
                 response
                     .get("incomplete_details")
@@ -428,8 +437,10 @@ pub fn process_responses_event(
                     .and_then(Value::as_str)
             });
             let reason = reason.unwrap_or("unknown");
-            let message = format!("Incomplete response returned, reason: {reason}");
-            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+            let message = format!("{INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX} {reason}");
+            return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
+                message,
+            }));
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
@@ -510,7 +521,13 @@ async fn process_sse_with_treatment(
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
+                // Instafy: a response.failed or response.incomplete event that has already
+                // arrived is the outcome of the request, and the upstream has billed it. A
+                // transport error or an idle timeout after that event reports it, as a clean
+                // close does, instead of a retryable stream error that would send the request
+                // again. The stream error is only for a stream that ends before such an event.
+                let error = response_error.unwrap_or_else(|| ApiError::Stream(e.to_string()));
+                let _ = tx_event.send(Err(error)).await;
                 return;
             }
             Ok(None) => {
@@ -521,9 +538,10 @@ async fn process_sse_with_treatment(
                 return;
             }
             Err(_) => {
-                let _ = tx_event
-                    .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
-                    .await;
+                // Instafy: as for a transport error above.
+                let error = response_error
+                    .unwrap_or_else(|| ApiError::Stream("idle timeout waiting for SSE".into()));
+                let _ = tx_event.send(Err(error)).await;
                 return;
             }
         };
@@ -668,6 +686,7 @@ mod tests {
     use bytes::Bytes;
     use codex_client::StreamResponse;
     use codex_client::TransportError;
+    use codex_protocol::error::CodexErr;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
     use futures::TryStreamExt;
@@ -1138,6 +1157,222 @@ mod tests {
                 other => panic!("unexpected event for {code}: {other:?}"),
             }
         }
+    }
+
+    /// A `response.incomplete` event as the Responses API sends it. Only
+    /// `incomplete_details` differs between the reasons a response can stop early.
+    fn incomplete_event(incomplete_details: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "response.incomplete",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_incomplete",
+                "object": "response",
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": incomplete_details,
+            },
+        })
+    }
+
+    /// Checks that `event` ends the request with an `InvalidRequest` carrying
+    /// `expected_message`, both from the SSE stream and from `process_responses_event`, which
+    /// the websocket transport calls for each event. A `Stream` error would be retried, and a
+    /// retry sends, and bills, the whole request again.
+    async fn assert_incomplete_is_not_retryable(event: serde_json::Value, expected_message: &str) {
+        let sse = format!("event: response.incomplete\ndata: {event}\n\n");
+        let mut events = collect_events(&[sse.as_bytes()]).await;
+        assert_eq!(events.len(), 1);
+        let sse_error = match events.remove(0) {
+            Err(error) => error,
+            Ok(event) => panic!("expected an error from the SSE stream, got {event:?}"),
+        };
+        let event: ResponsesStreamEvent =
+            serde_json::from_value(event).expect("incomplete event should parse");
+        let websocket_error = match process_responses_event(event) {
+            Err(error) => error.into_api_error(),
+            Ok(event) => panic!("expected an error from the websocket path, got {event:?}"),
+        };
+
+        for error in [sse_error, websocket_error] {
+            assert_incomplete_error(error, expected_message);
+        }
+    }
+
+    /// Checks that `error` is the non-retryable `InvalidRequest` for an incomplete response,
+    /// and that compaction recognizes it, so it does not send the request again either.
+    fn assert_incomplete_error(error: ApiError, expected_message: &str) {
+        assert!(
+            !matches!(error, ApiError::Stream(_)),
+            "an incomplete response must not be a retryable stream error: {error:?}"
+        );
+        match &error {
+            ApiError::InvalidRequest { message } => assert_eq!(message, expected_message),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        let error = crate::api_bridge::map_api_error(error);
+        assert!(!error.is_retryable(), "{error:?} must not be retryable");
+        assert!(
+            crate::api_bridge::is_instafy_incomplete_response(&error),
+            "compaction must recognize {error:?} as an incomplete response"
+        );
+        assert_matches!(
+            error,
+            CodexErr::InvalidRequest(message) if message == expected_message
+        );
+    }
+
+    /// Runs `process_sse` over `stream`, for endings that `collect_events` cannot produce:
+    /// a transport error, or a stream that stays open.
+    async fn collect_stream_events(
+        stream: ByteStream,
+        idle_timeout: Duration,
+    ) -> Vec<Result<ResponseEvent, ApiError>> {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
+        tokio::spawn(process_sse(
+            stream,
+            tx,
+            idle_timeout,
+            /*telemetry*/ None,
+        ));
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn incomplete_max_output_tokens_sse() -> Result<Bytes, TransportError> {
+        let event = incomplete_event(json!({ "reason": "max_output_tokens" }));
+        Ok(Bytes::from(format!(
+            "event: response.incomplete\ndata: {event}\n\n"
+        )))
+    }
+
+    fn single_error(mut events: Vec<Result<ResponseEvent, ApiError>>) -> ApiError {
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        match events.remove(0) {
+            Err(error) => error,
+            Ok(event) => panic!("expected an error, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_then_transport_error_is_not_retryable() {
+        let stream = stream::iter(vec![
+            incomplete_max_output_tokens_sse(),
+            Err(TransportError::Network("connection reset".to_string())),
+        ]);
+
+        let events = collect_stream_events(Box::pin(stream), idle_timeout()).await;
+
+        assert_incomplete_error(
+            single_error(events),
+            "Incomplete response returned, reason: max_output_tokens",
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_then_idle_stream_is_not_retryable() {
+        let stream =
+            stream::iter(vec![incomplete_max_output_tokens_sse()]).chain(stream::pending());
+
+        let events = collect_stream_events(Box::pin(stream), Duration::from_millis(50)).await;
+
+        assert_incomplete_error(
+            single_error(events),
+            "Incomplete response returned, reason: max_output_tokens",
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_or_idle_stream_before_a_terminal_event_is_retryable() {
+        let stream = stream::iter(vec![Err(TransportError::Network(
+            "connection reset".to_string(),
+        ))]);
+        let events = collect_stream_events(Box::pin(stream), idle_timeout()).await;
+        assert_matches!(
+            single_error(events),
+            ApiError::Stream(message) if message == "Transport error: network error: connection reset"
+        );
+
+        let stream = stream::pending::<Result<Bytes, TransportError>>();
+        let events = collect_stream_events(Box::pin(stream), Duration::from_millis(50)).await;
+        assert_matches!(
+            single_error(events),
+            ApiError::Stream(message) if message == "idle timeout waiting for SSE"
+        );
+    }
+
+    /// A response.failed event is reported the same way: the error it maps to, not the
+    /// transport error that follows it.
+    #[tokio::test]
+    async fn failed_then_transport_error_reports_the_failure() {
+        let failed = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model."
+                }
+            }
+        });
+        let stream = stream::iter(vec![
+            Ok(Bytes::from(format!(
+                "event: response.failed\ndata: {failed}\n\n"
+            ))),
+            Err(TransportError::Network("connection reset".to_string())),
+        ]);
+
+        let events = collect_stream_events(Box::pin(stream), idle_timeout()).await;
+
+        assert_matches!(single_error(events), ApiError::ContextWindowExceeded);
+    }
+
+    #[tokio::test]
+    async fn incomplete_max_output_tokens_is_not_retryable() {
+        assert_incomplete_is_not_retryable(
+            incomplete_event(json!({ "reason": "max_output_tokens" })),
+            "Incomplete response returned, reason: max_output_tokens",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_content_filter_is_not_retryable() {
+        assert_incomplete_is_not_retryable(
+            incomplete_event(json!({ "reason": "content_filter" })),
+            "Incomplete response returned, reason: content_filter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_without_reason_is_not_retryable() {
+        for event in [
+            incomplete_event(json!(null)),
+            incomplete_event(json!({})),
+            incomplete_event(json!({ "reason": null })),
+            json!({ "type": "response.incomplete" }),
+        ] {
+            assert_incomplete_is_not_retryable(
+                event,
+                "Incomplete response returned, reason: unknown",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_unrecognized_reason_is_not_retryable() {
+        assert_incomplete_is_not_retryable(
+            incomplete_event(json!({ "reason": "a_future_reason" })),
+            "Incomplete response returned, reason: a_future_reason",
+        )
+        .await;
     }
 
     #[tokio::test]

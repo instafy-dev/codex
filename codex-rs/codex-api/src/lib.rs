@@ -18,6 +18,7 @@ pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
 
+pub use crate::api_bridge::is_instafy_incomplete_response;
 pub use crate::api_bridge::map_api_error;
 pub use crate::auth::AgentIdentityTelemetry;
 pub use crate::auth::AuthError;

@@ -3759,12 +3759,13 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
         .await?;
 
     let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    // Instafy: an incomplete response is a non-retryable InvalidRequest rather than a stream
+    // error, so the message has no "stream disconnected before completion: " prefix.
     assert!(
         matches!(
             error_event,
             EventMsg::Error(ref err)
-                if err.message
-                    == "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+                if err.message == "Incomplete response returned, reason: content_filter"
         ),
         "expected incomplete content filter error; got {error_event:?}"
     );

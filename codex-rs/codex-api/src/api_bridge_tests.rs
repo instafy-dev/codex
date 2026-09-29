@@ -677,3 +677,29 @@ fn map_api_error_keeps_usage_limit_429_terminal_even_when_marked_retryable() {
     let err = map_429(Some(retry_after_headers("2")), body);
     assert!(matches!(err, CodexErr::UsageNotIncluded), "got {err:?}");
 }
+
+#[test]
+fn is_instafy_incomplete_response_matches_only_the_incomplete_invalid_request() {
+    let message = "Incomplete response returned, reason: content_filter";
+    assert!(is_instafy_incomplete_response(&CodexErr::InvalidRequest(
+        message.to_string()
+    )));
+
+    // A rejected request, and any other error that carries the same text, keep their
+    // handling, including the compaction fallback to the current model.
+    let rejected = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://proxy:8789/v1/responses".to_string()),
+        headers: None,
+        body: Some(serde_json::json!({ "detail": message }).to_string()),
+    }));
+    assert!(
+        matches!(rejected, CodexErr::InvalidRequest(_)),
+        "got {rejected:?}"
+    );
+    assert!(!is_instafy_incomplete_response(&rejected));
+    assert!(!is_instafy_incomplete_response(&CodexErr::Stream(
+        message.to_string(),
+        /*delay*/ None,
+    )));
+}

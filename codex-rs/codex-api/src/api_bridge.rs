@@ -191,6 +191,11 @@ const INSTAFY_RETRYABLE_429_MAX_DELAY: Duration = Duration::from_secs(30);
 // Retry-After and would all retry at the same instant. Waiting up to this much longer,
 // never shorter, spreads them out while still honoring the proxy's floor.
 const INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT: u32 = 20;
+// Starts the message of the InvalidRequest that a `response.incomplete` event ends a
+// request with (sse/responses.rs). `is_instafy_incomplete_response` reads it, so callers
+// that re-send an InvalidRequest anyway can leave this one alone.
+pub(crate) const INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX: &str =
+    "Incomplete response returned, reason:";
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -258,6 +263,20 @@ fn instafy_retryable_error_message(body: &str) -> Option<String> {
             str::to_string,
         );
     Some(message)
+}
+
+/// Returns true for the error that a `response.incomplete` event ends a request with.
+/// Instafy bills that response once the upstream has produced it, and a max_output_tokens
+/// cap or a content_filter stop would most likely end the same way on the next request.
+/// The error is an InvalidRequest, so the stream retry budget already leaves it alone, but
+/// compaction re-sends some InvalidRequests: on the current model after the previous model
+/// failed, and on any error during local compaction. Those callers check this first.
+pub fn is_instafy_incomplete_response(error: &CodexErr) -> bool {
+    matches!(
+        error,
+        CodexErr::InvalidRequest(message)
+            if message.starts_with(INSTAFY_INCOMPLETE_RESPONSE_MESSAGE_PREFIX)
+    )
 }
 
 /// Reads Retry-After as delta-seconds or an HTTP date and clamps it, so a
