@@ -44,7 +44,8 @@ patch_tests=(
   "codex_core|session::turn::tests::|11be4c61f turn lifecycle"
   "all|retryable_proxy_rate_limit::|99f24c873 retryable proxy 429 end to end"
   "all|responses_lite::|3745197c1 responses-lite required tool choice"
-  "all|incomplete|upstream incomplete-response coverage; narrow to incomplete_response_not_retried:: once #3 lands"
+  "all|incomplete_response_not_retried::|43d6fc58 3cd0ddcd 41ab6cf9 incomplete responses are not re-sent"
+  "all|client::incomplete_response_emits_content_filter_error_message|43d6fc58 the incomplete response error message"
 )
 
 # One package set and one target selection for the whole test build and run.
