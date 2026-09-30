@@ -1,17 +1,20 @@
-# The only workflow this fork runs. Instafy consumes the fork as the `codex`
-# submodule of instafy-dev/instafy, whose CI builds and tests runtime-agent
-# against it, so this checks only what Instafy relies on. See INSTAFY.md.
+# The only workflow this fork runs. Instafy consumes the fork as the `codex` submodule of
+# instafy-dev/instafy, whose CI builds and tests runtime-agent against it. This workflow proves
+# the fork is what INSTAFY-PATCHES.toml says it is: the upstream tag plus the Instafy files and
+# the registered patches. With no registered patches it runs no cargo at all. See INSTAFY.md.
 #
-# Standard ubuntu-24.04 runners only: never larger runners, macOS or Windows.
+# Standard ubuntu-24.04 runners only: never larger runners, macOS or Windows. The workflow
+# allowlist (ci.sh workflow-allowlist, also a bump.sh gate) fails any other runs-on.
 name: instafy-ci
 
 on:
-  # Every PR whose merge commit carries this file, stacked PRs included; the
-  # jobs still run only on standard ubuntu-24.04 runners.
+  # Every PR whose merge commit carries this file, stacked PRs included.
   pull_request:
   push:
     branches:
       - instafy/integration
+      - instafy/base/**
+      - instafy/rust-v*
   workflow_dispatch:
 
 permissions:
@@ -26,65 +29,55 @@ jobs:
     name: Workflow allowlist
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      rust: ${{ steps.changes.outputs.rust }}
     steps:
       - name: Check out
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # A pull_request checkout is the merge commit; depth 2 keeps its
-          # first parent, the base branch, for the change detection below.
-          fetch-depth: 2
           persist-credentials: false
 
-      - name: Only instafy-ci.yml, no Dependabot config
+      - name: Only instafy-ci.yml on ubuntu-24.04, no Dependabot config or CODEOWNERS
         run: bash .github/instafy/ci.sh workflow-allowlist
 
-      - name: Detect Rust-relevant changes
-        id: changes
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          run_rust() {
-            echo "rust=true: $1"
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-          case "$EVENT_NAME" in
-            pull_request)
-              base="$(git rev-parse HEAD^1)"
-              ;;
-            push)
-              base="$PUSH_BEFORE"
-              if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
-                run_rust "new branch, nothing to diff against"
-              fi
-              git fetch --no-tags --depth=1 origin "$base" || run_rust "could not fetch $base"
-              ;;
-            *)
-              run_rust "$EVENT_NAME always runs the Rust checks"
-              ;;
-          esac
-          changed="$(git diff --name-only "$base" HEAD)"
-          printf 'Changed files:\n%s\n' "$changed"
-          if grep -Eq '^(codex-rs/|\.github/instafy/|\.github/workflows/instafy-ci\.yml$)' <<<"$changed"; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No Rust-relevant changes; skipping the Rust job."
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
+  tree-identity:
+    name: Tree identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      patches: ${{ steps.identity.outputs.patches }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-  rust:
-    name: Rust (Instafy patch tests)
-    needs: workflow-allowlist
-    if: needs.workflow-allowlist.outputs.rust == 'true'
+      # Format, closure_dirs, and base_commit against openai/codex's tag (a read of the public
+      # upstream repository).
+      - name: INSTAFY-PATCHES.toml format
+        run: bash .github/instafy/ci.sh registry
+
+      # Fetches base_commit's trees only, then fails unless the tree differs from the upstream
+      # tag in the Instafy files, deleted upstream automation and registered patch files alone:
+      # all of them, or none on a generated base (instafy/base/<tag>). Outputs the number of
+      # patches the tree carries, 0 on a generated base.
+      - name: Only the Instafy files and registered patches differ from the upstream tag
+        id: identity
+        run: bash .github/instafy/ci.sh tree-identity
+
+      - name: bump.sh and registry self-test
+        run: bash .github/instafy/ci.sh self-test
+
+  # Runs only when the tree carries registered patches: builds and runs each patch's
+  # fork_tests. With none (no patches registered, or a generated base, whose registry lists the
+  # patches but whose codex-rs is the bare tag) there is nothing to build.
+  patch-tests:
+    name: Registered patch tests
+    needs: tree-identity
+    if: needs.tree-identity.outputs.patches != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      # Build settings (CARGO_INCREMENTAL=0, no debuginfo, RUST_MIN_STACK)
-      # live in ci.sh so a local run matches CI.
+      # Build settings (CARGO_INCREMENTAL=0, no debuginfo, RUST_MIN_STACK) live in ci.sh so a
+      # local run matches CI.
       CARGO_TERM_COLOR: always
     steps:
       - name: Check out
@@ -92,8 +85,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # The build needs roughly 10 GiB (a 6 GiB target dir plus the registry
-      # and cache archive). Only clear preinstalled SDKs when space is short.
+      # The build needs roughly 10 GiB. Only clear preinstalled SDKs when space is short.
       - name: Make room for the build
         run: |
           set -euo pipefail
@@ -104,14 +96,13 @@ jobs:
             df -h /
           fi
 
-      # Installs 1.95.0, the channel in codex-rs/rust-toolchain.toml. If a sync
-      # moves that file to a newer channel, rustup installs it on first use.
+      # Installs 1.95.0, the channel in codex-rs/rust-toolchain.toml at rust-v0.159.2. If a
+      # bump moves that file to a newer channel, rustup installs it on first use.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
-      # Pull requests restore the newest cache of their base branch. Pushes
-      # restore only an exact key, so a new key is always saved from a clean
-      # build and stale artifacts do not accumulate across syncs.
+      # Pull requests restore the newest cache of their base branch. Pushes restore only an
+      # exact key, so a new key is always saved from a clean build.
       - name: Restore Rust cache
         id: rust-cache
         uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
@@ -121,11 +112,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             codex-rs/target/
-          key: instafy-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml', '.github/instafy/ci.sh', '.github/workflows/instafy-ci.yml') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('instafy-rust-v1-{0}-{1}-', runner.os, runner.arch) || '' }}
+          key: instafy-rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml', '.github/instafy/ci.sh', 'INSTAFY-PATCHES.toml') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('instafy-rust-v2-{0}-{1}-', runner.os, runner.arch) || '' }}
 
-      - name: Build and run the Instafy patch tests
-        run: bash .github/instafy/ci.sh rust
+      - name: Build and run the registered patch tests
+        run: bash .github/instafy/ci.sh patch-tests
 
       - name: Save Rust cache
         if: success() && github.event_name == 'push' && steps.rust-cache.outputs.cache-hit != 'true'

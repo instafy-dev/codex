@@ -66,6 +66,9 @@ fn normalized_summary_path(mut summary: ConversationSummary) -> Result<Conversat
     if !summary.path.as_os_str().is_empty() {
         summary.path = normalized_canonical_path(summary.path)?;
     }
+    if !summary.cwd.as_os_str().is_empty() {
+        summary.cwd = AbsolutePathBuf::from_absolute_path(summary.cwd)?.into_path_buf();
+    }
     Ok(summary)
 }
 
@@ -119,6 +122,8 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
     let thread_id = ThreadId::from_string("00000000-0000-4000-8000-000000000125")?;
     store
         .create_thread(CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -132,8 +137,10 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: Default::default(),
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
@@ -156,6 +163,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,

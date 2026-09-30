@@ -11,6 +11,8 @@ use codex_app_server::in_process;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DeprecationNoticeNotification;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
@@ -22,6 +24,9 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
+use codex_app_server_protocol::ThreadItemsListAnchor;
+use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListParams;
@@ -63,7 +68,6 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -71,11 +75,13 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::RolloutItem;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
@@ -133,8 +139,13 @@ async fn thread_read_returns_summary_without_turns() -> Result<()> {
             include_turns: false,
         })
         .await?;
-    let ThreadReadResponse { thread, .. } =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    let response: Value = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    assert_eq!(response["thread"].get("model"), Some(&Value::Null));
+    assert_eq!(
+        response["thread"].get("reasoningEffort"),
+        Some(&Value::Null)
+    );
+    let ThreadReadResponse { thread, .. } = serde_json::from_value(response)?;
 
     assert_eq!(thread.id, conversation_id);
     assert_eq!(thread.preview, preview);
@@ -147,6 +158,17 @@ async fn thread_read_returns_summary_without_turns() -> Result<()> {
     assert_eq!(thread.git_info, None);
     assert_eq!(thread.turns.len(), 0);
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
+
+    let list_id = mcp.send_raw_request("thread/list", Some(json!({}))).await?;
+    let response: Value = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(list_id)).await??;
+    let listed = response["data"]
+        .as_array()
+        .expect("thread list")
+        .iter()
+        .find(|listed| listed["id"] == conversation_id)
+        .expect("stored thread should be listed");
+    assert_eq!(listed.get("model"), Some(&Value::Null));
+    assert_eq!(listed.get("reasoningEffort"), Some(&Value::Null));
 
     Ok(())
 }
@@ -208,13 +230,90 @@ async fn thread_read_can_include_turns() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    Ok(())
+}
+
+/// Preserves a file-backed image across a completed turn, including a cold history read.
+#[tokio::test]
+async fn thread_read_preserves_file_id_from_completed_turn() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    let image = UserInput::Image {
+        image: ImageReference::File {
+            file_id: "file_123".to_string(),
+        },
+        detail: None,
+    };
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![image.clone()],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse {
+        thread: loaded_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    let ThreadItem::UserMessage { content, .. } = &loaded_thread.turns[0].items[0] else {
+        panic!("expected completed turn to start with a user message");
+    };
+    assert_eq!(content, &vec![image.clone()]);
+
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    drop(mcp);
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse {
+        thread: restarted_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    let ThreadItem::UserMessage { content, .. } = &restarted_thread.turns[0].items[0] else {
+        panic!("expected persisted turn to start with a user message");
+    };
+    assert_eq!(content, &vec![image]);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn paginated_stored_thread_routes_projected_turns_and_rejects_legacy_history_paths()
--> Result<()> {
+async fn paginated_stored_thread_routes_projected_turns() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
@@ -244,9 +343,35 @@ async fn paginated_stored_thread_routes_projected_turns_and_rejects_legacy_histo
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
     assert!(thread.turns.is_empty());
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    let full_read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let notice: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    assert_eq!(
+        notice,
+        DeprecationNoticeNotification {
+            summary: "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.".to_string(),
+            details: None,
+        }
+    );
+    let _: ThreadReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(full_read_id)).await??;
 
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,
@@ -254,6 +379,8 @@ async fn paginated_stored_thread_routes_projected_turns_and_rejects_legacy_histo
             model_providers: Some(vec!["mock_provider".to_string()]),
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -268,23 +395,6 @@ async fn paginated_stored_thread_routes_projected_turns_and_rejects_legacy_histo
         .find(|thread| thread.id == conversation_id)
         .expect("thread/list should include paginated thread");
     assert_eq!(listed.history_mode, ThreadHistoryMode::Paginated);
-
-    let read_id = mcp
-        .send_thread_read_request(ThreadReadParams {
-            thread_id: conversation_id.clone(),
-            include_turns: true,
-        })
-        .await?;
-    let read_err: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(read_id)),
-    )
-    .await??;
-    assert_eq!(read_err.error.code, -32600);
-    assert_eq!(
-        read_err.error.message,
-        "paginated threads do not support thread/read(includeTurns=true)"
-    );
 
     let turns_list_id = mcp
         .send_thread_turns_list_request(ThreadTurnsListParams {
@@ -470,8 +580,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
     let thread_id = codex_protocol::ThreadId::default();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let state_db =
-        codex_state::StateRuntime::init(sqlite.home().to_path_buf(), "mock_provider".to_string())
-            .await?;
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
     let store = LocalThreadStore::new(
         LocalThreadStoreConfig {
             codex_home: codex_home.path().to_path_buf(),
@@ -482,6 +591,8 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
     );
     store
         .create_thread(CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -495,8 +606,10 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(codex_home.path().to_path_buf()),
                 model_provider: "mock_provider".to_string(),
@@ -504,7 +617,9 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
             },
         })
         .await?;
-    store.persist_thread(thread_id).await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -550,6 +665,8 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                         }],
                         phase: Some(MessagePhase::Commentary),
                         memory_citation: None,
+                        delivery: None,
+                        questions: None,
                     }),
                 ),
                 paginated_completed_item(
@@ -562,6 +679,8 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                         }],
                         phase: Some(MessagePhase::FinalAnswer),
                         memory_citation: None,
+                        delivery: None,
+                        questions: None,
                     }),
                 ),
                 paginated_turn_completed("turn-1"),
@@ -642,6 +761,75 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
     assert_eq!(data[2].snippet_match_range.end, 15);
     assert_eq!(next_cursor, None);
 
+    let fork_request_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_request_id)).await??;
+    let forked_thread_id = thread.id;
+    let source_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(source_resume_id)).await??;
+    for (target_thread_id, text) in [
+        (thread_id.to_string(), "excluded parent needle"),
+        (forked_thread_id.clone(), "child needle"),
+    ] {
+        let turn_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: target_thread_id,
+                input: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+    let request_id = mcp
+        .send_thread_search_occurrences_request(ThreadSearchOccurrencesParams {
+            thread_id: forked_thread_id.clone(),
+            search_term: "needle".to_string(),
+            cursor: None,
+            limit: Some(6),
+        })
+        .await?;
+    let ThreadSearchOccurrencesResponse { data, next_cursor } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(data.len(), 6);
+    assert!(
+        data.iter()
+            .all(|occurrence| !occurrence.snippet.contains("excluded parent needle"))
+    );
+    let next_cursor = next_cursor.expect("search should continue into child history");
+    let request_id = mcp
+        .send_thread_search_occurrences_request(ThreadSearchOccurrencesParams {
+            thread_id: forked_thread_id,
+            search_term: "needle".to_string(),
+            cursor: Some(next_cursor),
+            limit: Some(6),
+        })
+        .await?;
+    let ThreadSearchOccurrencesResponse { data, next_cursor } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(data.len(), 1);
+    assert!(data[0].snippet.contains("child needle"));
+    assert_eq!(next_cursor, None);
+
     Ok(())
 }
 
@@ -673,6 +861,7 @@ async fn thread_turns_list_reads_store_history_without_rollout_path() -> Result<
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,
@@ -743,6 +932,7 @@ async fn thread_read_loaded_include_turns_reads_store_history_without_rollout_pa
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,
@@ -851,6 +1041,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,
@@ -878,6 +1069,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
         .request(ClientRequest::ThreadList {
             request_id: RequestId::Integer(1),
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -885,6 +1077,8 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
                 model_providers: Some(Vec::new()),
                 source_kinds: None,
                 archived: None,
+                section_id: None,
+                project_id: None,
                 cwd: None,
                 use_state_db_only: false,
                 search_term: None,
@@ -1202,7 +1396,7 @@ async fn paginated_thread_name_set_is_reflected_in_read_list_and_metadata_resume
         .await?;
 
     // Set a user-facing thread title.
-    let new_name = "Saved user message";
+    let new_name = "Custom saved name";
     let set_id = mcp
         .send_thread_set_name_request(ThreadSetNameParams {
             thread_id: conversation_id.clone(),
@@ -1256,6 +1450,7 @@ async fn paginated_thread_name_set_is_reflected_in_read_list_and_metadata_resume
     // List should also surface the name.
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,
@@ -1263,6 +1458,8 @@ async fn paginated_thread_name_set_is_reflected_in_read_list_and_metadata_resume
             model_providers: Some(vec!["mock_provider".to_string()]),
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: true,
             search_term: None,
@@ -1352,6 +1549,7 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;
@@ -1440,15 +1638,14 @@ async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> 
 }
 
 #[tokio::test]
-async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
+async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
     let thread_id = codex_protocol::ThreadId::default();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let state_db =
-        codex_state::StateRuntime::init(sqlite.home().to_path_buf(), "mock_provider".to_string())
-            .await?;
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
     let store = LocalThreadStore::new(
         LocalThreadStoreConfig {
             codex_home: codex_home.path().to_path_buf(),
@@ -1459,6 +1656,8 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
     );
     store
         .create_thread(CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -1472,8 +1671,10 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(codex_home.path().to_path_buf()),
                 model_provider: "mock_provider".to_string(),
@@ -1481,7 +1682,9 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
             },
         })
         .await?;
-    store.persist_thread(thread_id).await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -1515,6 +1718,17 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
                         }],
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
+                        questions: None,
+                    }),
+                ),
+                paginated_completed_item(
+                    thread_id,
+                    "turn-1",
+                    CoreTurnItem::UserMessage(UserMessageItem {
+                        id: "steer-1".to_string(),
+                        client_id: Some("updated-steer".to_string()),
+                        content: Vec::new(),
                     }),
                 ),
                 paginated_turn_completed("turn-1"),
@@ -1549,7 +1763,7 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
             },
             ThreadItem::UserMessage {
                 id: "steer-1".to_string(),
-                client_id: None,
+                client_id: Some("updated-steer".to_string()),
                 content: Vec::new(),
             },
             ThreadItem::AgentMessage {
@@ -1557,6 +1771,8 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
                 text: "first".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
         ],
         items_view: TurnItemsView::Full,
@@ -1581,6 +1797,17 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
         duration_ms: None,
     };
     let expected_full_turns = vec![expected_turn_1_full.clone(), expected_turn_2_full.clone()];
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse {
+        thread: unloaded_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    assert_eq!(unloaded_thread.turns, expected_full_turns);
 
     let legacy_resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -1731,6 +1958,8 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
                     text: "first".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 },
             ],
             items_view: TurnItemsView::Summary,
@@ -1785,9 +2014,19 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
         SortDirection::Asc,
     )
     .await?;
-    assert_eq!(first_items_page.data.len(), 1);
-    assert_eq!(first_items_page.data[0].turn_id, "turn-1");
-    assert_eq!(first_items_page.data[0].item.id(), "user-1");
+    assert_eq!(
+        first_items_page.data,
+        vec![ThreadItemEntry {
+            turn_id: "turn-1".to_string(),
+            item: ThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                client_id: None,
+                content: Vec::new(),
+            },
+            started_at_ms: Some(0),
+            completed_at_ms: Some(1),
+        }]
+    );
     let second_items_page = read_items_page(
         &mut mcp,
         thread_id,
@@ -1815,6 +2054,84 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
     assert_eq!(third_items_page.data[1].turn_id, "turn-2");
     assert_eq!(third_items_page.data[1].item.id(), "user-2");
 
+    let anchor_params = ThreadItemsListParams {
+        thread_id: thread_id.to_string(),
+        turn_id: Some("turn-1".to_string()),
+        cursor: None,
+        limit: Some(1),
+        sort_direction: None,
+    };
+    for direction in [None, Some(SortDirection::Desc)] {
+        let request = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                limit: Some(10),
+                sort_direction: direction,
+                ..anchor_params.clone()
+            })
+            .await?;
+        let ordinary: ThreadItemsListResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request)).await??;
+        assert_eq!(ordinary.data.len(), 3);
+        let request = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                cursor: Some(ThreadItemsListCursor::Anchor(ThreadItemsListAnchor::Item {
+                    item_id: ordinary.data[0].item.id().to_string(),
+                })),
+                sort_direction: direction,
+                ..anchor_params.clone()
+            })
+            .await?;
+        let anchored: ThreadItemsListResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request)).await??;
+        assert_eq!(anchored.data, ordinary.data[1..2]);
+        let request = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                cursor: Some(ThreadItemsListCursor::Opaque(
+                    anchored
+                        .next_cursor
+                        .expect("anchored page has a continuation"),
+                )),
+                sort_direction: direction,
+                ..anchor_params.clone()
+            })
+            .await?;
+        let continued: ThreadItemsListResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request)).await??;
+        assert_eq!(continued.data, ordinary.data[2..]);
+        assert_eq!(continued.next_cursor, None);
+    }
+    for (turn_id, anchor, message) in [
+        (
+            None,
+            "steer-1",
+            "turnId is required when cursor is an item anchor",
+        ),
+        (
+            Some("turn-1"),
+            "missing",
+            "cursor.itemId does not identify an item in the requested history scope",
+        ),
+    ] {
+        let request = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                turn_id: turn_id.map(str::to_string),
+                cursor: Some(ThreadItemsListCursor::Anchor(ThreadItemsListAnchor::Item {
+                    item_id: anchor.to_string(),
+                })),
+                ..anchor_params.clone()
+            })
+            .await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request)),
+        )
+        .await??;
+        assert_eq!(
+            (error.error.code, error.error.message.as_str()),
+            (-32602, message)
+        );
+    }
+
     let turn_start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.to_string(),
@@ -1833,6 +2150,21 @@ async fn paginated_history_lists_use_projected_turns_and_items() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse {
+        thread: loaded_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    assert_eq!(&loaded_thread.turns[..2], expected_full_turns);
+    assert_eq!(
+        turn_user_texts(&loaded_thread.turns),
+        vec!["continue after legacy resume"]
+    );
 
     Ok(())
 }
@@ -1961,6 +2293,8 @@ fn append_agent_message(path: &Path, timestamp: &str, text: &str) -> anyhow::Res
                 message: text.to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }))?,
         })
     )?;
@@ -2045,7 +2379,7 @@ async fn read_items_page(
         .send_thread_items_list_request(ThreadItemsListParams {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.map(str::to_string),
-            cursor,
+            cursor: cursor.map(ThreadItemsListCursor::Opaque),
             limit,
             sort_direction: Some(sort_direction),
         })
@@ -2061,6 +2395,7 @@ async fn read_items_page(
 fn paginated_turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: Some(10),
         model_context_window: None,
@@ -2089,6 +2424,7 @@ fn paginated_completed_item(
         thread_id,
         turn_id: turn_id.to_string(),
         item,
+        started_at_ms: Some(0),
         completed_at_ms: 1,
     }))
 }
@@ -2138,6 +2474,8 @@ async fn seed_pathless_store_thread(
 ) -> Result<()> {
     store
         .create_thread(CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -2151,8 +2489,10 @@ async fn seed_pathless_store_thread(
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
             history_mode: Default::default(),
+            history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),

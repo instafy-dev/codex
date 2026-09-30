@@ -1,7 +1,7 @@
 use super::*;
 use crate::plugin_bundle_archive::PluginBundlePackError;
 use crate::plugin_bundle_archive::pack_plugin_bundle_tar_gz;
-use codex_http_client::RouteAwareRequestBuilder;
+use codex_http_client::RequestBuilder;
 use codex_login::CodexAuth;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Method;
@@ -25,6 +25,7 @@ pub use checkout::checkout_remote_plugin_share;
 pub struct RemotePluginShareSaveResult {
     pub remote_plugin_id: String,
     pub share_url: Option<String>,
+    pub can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -123,6 +124,8 @@ struct RemoteWorkspacePluginCreateRequest {
 struct RemoteWorkspacePluginCreateResponse {
     plugin_id: String,
     share_url: Option<String>,
+    #[serde(default)]
+    can_publish_to_workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -201,6 +204,7 @@ pub async fn save_remote_plugin_share(
     Ok(RemotePluginShareSaveResult {
         remote_plugin_id: response.plugin_id,
         share_url: response.share_url,
+        can_publish_to_workspace: response.can_publish_to_workspace,
     })
 }
 
@@ -281,7 +285,11 @@ pub async fn delete_remote_plugin_share(
     let auth = ensure_chatgpt_auth(auth)?;
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/public/plugins/workspace/{remote_plugin_id}");
-    let request = authenticated_request(config.http_request(Method::DELETE, &url), auth);
+    let request = authenticated_request(
+        config.http_request(Method::DELETE, &url),
+        auth,
+        &config.product_sku,
+    );
     send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
     if let Err(err) = local_paths::remove_plugin_share_local_path(codex_home, remote_plugin_id) {
         warn!(
@@ -314,12 +322,15 @@ pub async fn update_remote_plugin_share_targets(
             .unwrap_or_default();
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{remote_plugin_id}/shares");
-    let request = authenticated_request(config.http_request(Method::PUT, &url), auth).json(
-        &RemotePluginShareUpdateTargetsRequest {
-            discoverability,
-            targets,
-        },
-    );
+    let request = authenticated_request(
+        config.http_request(Method::PUT, &url),
+        auth,
+        &config.product_sku,
+    )
+    .json(&RemotePluginShareUpdateTargetsRequest {
+        discoverability,
+        targets,
+    });
     let response: RemotePluginShareUpdateTargetsResponse = send_and_decode(request, &url).await?;
     Ok(RemotePluginShareUpdateTargetsResult {
         principals: response.principals,
@@ -386,7 +397,11 @@ async fn get_created_workspace_plugins_page(
         url.query_pairs_mut().append_pair("pageToken", page_token);
     }
     let url = url.to_string();
-    let request = authenticated_request(config.http_request(Method::GET, &url), auth);
+    let request = authenticated_request(
+        config.http_request(Method::GET, &url),
+        auth,
+        &config.product_sku,
+    );
     send_and_decode(request, &url).await
 }
 
@@ -399,14 +414,17 @@ async fn create_workspace_plugin_upload(
 ) -> Result<RemoteWorkspacePluginUploadUrlResponse, RemotePluginCatalogError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/public/plugins/workspace/upload-url");
-    let request = authenticated_request(config.http_request(Method::POST, &url), auth).json(
-        &RemoteWorkspacePluginUploadUrlRequest {
-            filename,
-            mime_type: "application/gzip",
-            size_bytes,
-            plugin_id: remote_plugin_id,
-        },
-    );
+    let request = authenticated_request(
+        config.http_request(Method::POST, &url),
+        auth,
+        &config.product_sku,
+    )
+    .json(&RemoteWorkspacePluginUploadUrlRequest {
+        filename,
+        mime_type: "application/gzip",
+        size_bytes,
+        plugin_id: remote_plugin_id,
+    });
     send_and_decode(request, &url).await
 }
 
@@ -429,7 +447,13 @@ async fn put_workspace_plugin_upload(
             source,
         })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = response
+        .text()
+        .await
+        .map_err(|source| RemotePluginCatalogError::Request {
+            url: "workspace plugin upload URL".to_string(),
+            source,
+        })?;
     if ![StatusCode::OK, StatusCode::CREATED].contains(&status) {
         return Err(RemotePluginCatalogError::UnexpectedStatus {
             url: "workspace plugin upload URL".to_string(),
@@ -452,7 +476,12 @@ async fn finalize_workspace_plugin_upload(
     } else {
         format!("{base_url}/public/plugins/workspace")
     };
-    let request = authenticated_request(config.http_request(Method::POST, &url), auth).json(&body);
+    let request = authenticated_request(
+        config.http_request(Method::POST, &url),
+        auth,
+        &config.product_sku,
+    )
+    .json(&body);
     send_and_decode(request, &url).await
 }
 
@@ -490,7 +519,7 @@ fn archive_plugin_for_upload_with_limit(
 }
 
 async fn send_and_expect_status(
-    request: RouteAwareRequestBuilder,
+    request: RequestBuilder,
     url_for_error: &str,
     expected_statuses: &[StatusCode],
 ) -> Result<(), RemotePluginCatalogError> {
@@ -502,7 +531,13 @@ async fn send_and_expect_status(
             source,
         })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = response
+        .text()
+        .await
+        .map_err(|source| RemotePluginCatalogError::Request {
+            url: url_for_error.to_string(),
+            source,
+        })?;
     if !expected_statuses.contains(&status) {
         return Err(RemotePluginCatalogError::UnexpectedStatus {
             url: url_for_error.to_string(),

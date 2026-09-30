@@ -1,3 +1,4 @@
+use codex_utils_absolute_path::test_support::PathExt;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -7,14 +8,29 @@ use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::start_analytics_events_server;
 use app_test_support::write_chatgpt_auth;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigReadParams;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigReadResponse;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigRequirementsReadResponse;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigValueWriteParams;
+#[cfg(unix)]
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportHistoriesReadResponse;
+use codex_app_server_protocol::ExternalAgentConfigImportHistoryRecordResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportProgressNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
+#[cfg(unix)]
+use codex_app_server_protocol::ExternalAgentConfigImportTypeResult;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
 use codex_app_server_protocol::ExternalAgentImportedConnectorCandidate;
 use codex_app_server_protocol::ExternalAgentImportedConnectorSource;
+#[cfg(unix)]
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::RequestId;
@@ -28,6 +44,8 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+#[cfg(unix)]
+use codex_app_server_protocol::WriteStatus;
 use codex_config::types::AuthCredentialsStoreMode;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -125,12 +143,205 @@ async fn external_agent_config_detect_accepts_migration_source_and_defaults_unkn
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn external_agent_config_import_skips_repository_redirect_after_detection() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let repository = TempDir::new()?;
+    let repo_root = repository.path();
+    let repo_config_dir = repo_root.join(".codex");
+    let global_config = codex_home.path().join("config.toml");
+    std::fs::create_dir(repo_root.join(".git"))?;
+    std::fs::create_dir(&repo_config_dir)?;
+    std::fs::write(
+        repo_root.join(".mcp.json"),
+        r#"{"mcpServers":{"repository-server":{"command":"repository-server"}}}"#,
+    )?;
+    std::fs::write(&global_config, "model = \"gpt-5.4\"\n")?;
+
+    let home_dir = codex_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let original_global_config = std::fs::read_to_string(&global_config)?;
+
+    let detect_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/detect",
+            Some(serde_json::json!({
+                "includeHome": false,
+                "cwds": [repo_root],
+            })),
+        )
+        .await?;
+    let detection: ExternalAgentConfigDetectResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(detect_request_id)).await??;
+    assert_eq!(detection.items.len(), 1);
+    assert_eq!(
+        detection.items[0].item_type,
+        ExternalAgentConfigMigrationItemType::McpServerConfig
+    );
+
+    std::fs::remove_dir(&repo_config_dir)?;
+    std::os::unix::fs::symlink(codex_home.path(), &repo_config_dir)?;
+
+    let import_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import",
+            Some(serde_json::json!({
+                "migrationItems": detection.items,
+            })),
+        )
+        .await?;
+    let response: ExternalAgentConfigImportResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(import_request_id)).await??;
+    let import_id = assert_import_response(response);
+    let completed: ExternalAgentConfigImportCompletedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_notification("externalAgentConfig/import/completed"),
+    )
+    .await??;
+
+    assert_eq!(
+        completed,
+        ExternalAgentConfigImportCompletedNotification {
+            import_id,
+            item_type_results: vec![ExternalAgentConfigImportTypeResult {
+                item_type: ExternalAgentConfigMigrationItemType::McpServerConfig,
+                successes: Vec::new(),
+                failures: Vec::new(),
+            }],
+        }
+    );
+    assert_eq!(
+        std::fs::read_to_string(global_config)?,
+        original_global_config
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_agent_config_detect_does_not_block_configuration_reads() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let project_root = codex_home.path().join("repo");
+    let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
+    let session_path = session_dir.join("session.jsonl");
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::create_dir_all(&session_dir)?;
+    let status = std::process::Command::new("mkfifo")
+        .arg(&session_path)
+        .status()?;
+    assert!(status.success());
+
+    let home_dir = codex_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let detect_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/detect",
+            Some(serde_json::json!({ "includeHome": true })),
+        )
+        .await?;
+
+    // Opening the FIFO for writing succeeds only after detection opens it for
+    // reading. Keep the writer open without writing so transcript parsing stays
+    // blocked while unrelated configuration requests run.
+    let mut blocked_session_writer = timeout(
+        DEFAULT_TIMEOUT,
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&session_path),
+    )
+    .await??;
+
+    let config_request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let _: ConfigReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(config_request_id)).await??;
+
+    let requirements_request_id = mcp.send_config_requirements_read_request().await?;
+    let _: ConfigRequirementsReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(requirements_request_id)).await??;
+
+    let write_request_id = mcp
+        .send_config_value_write_request(ConfigValueWriteParams {
+            file_path: None,
+            key_path: "model".to_string(),
+            value: serde_json::json!("gpt-concurrent"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    let write: ConfigWriteResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(write_request_id)).await??;
+    assert_eq!(write.status, WriteStatus::Ok);
+
+    let import_request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import",
+            Some(serde_json::json!({ "migrationItems": [] })),
+        )
+        .await?;
+    let import_response: ExternalAgentConfigImportResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(import_request_id)).await??;
+    assert!(!import_response.import_id.is_empty());
+
+    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let session_contents = serde_json::json!({
+        "type": "user",
+        "cwd": &project_root,
+        "timestamp": &recent_timestamp,
+        "message": { "content": "first request" },
+    })
+    .to_string();
+
+    // Later connector discovery reopens the transcript. Replace the named FIFO
+    // before releasing its existing reader so subsequent opens see a real file.
+    std::fs::remove_file(&session_path)?;
+    std::fs::write(&session_path, &session_contents)?;
+    blocked_session_writer
+        .write_all(session_contents.as_bytes())
+        .await?;
+    drop(blocked_session_writer);
+
+    let detected: ExternalAgentConfigDetectResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(detect_request_id)).await??;
+    assert_eq!(detected.items.len(), 1);
+    assert_eq!(
+        detected.items[0].item_type,
+        ExternalAgentConfigMigrationItemType::Sessions
+    );
+    assert!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?
+            .contains("model = \"gpt-concurrent\"")
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn external_agent_config_migration_source_drives_detect_and_import() -> Result<()> {
     let codex_home = TempDir::new()?;
     let source_home = secondary_external_agent_home(codex_home.path());
     std::fs::create_dir_all(&source_home)?;
-    std::fs::write(source_home.join("sandbox.json"), r#"{"type":"read_only"}"#)?;
+    std::fs::write(
+        source_home.join("cli-config.json"),
+        r#"{"env":{"SOURCE":"secondary"}}"#,
+    )?;
     let home_dir = codex_home.path().display().to_string();
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -179,7 +390,7 @@ async fn external_agent_config_migration_source_drives_detect_and_import() -> Re
     assert_eq!(completed.item_type_results[0].failures, Vec::new());
     assert!(
         std::fs::read_to_string(codex_home.path().join("config.toml"))?
-            .contains("sandbox_mode = \"read-only\"")
+            .contains("SOURCE = \"secondary\"")
     );
 
     Ok(())
@@ -247,23 +458,13 @@ async fn external_agent_config_secondary_source_imports_session_and_plugin_end_t
 {
     let codex_home = TempDir::new()?;
     let source_home = secondary_external_agent_home(codex_home.path());
-    let project_root = codex_home.path().join("workspace with.dots_and-dashes");
+    let project_root = codex_home.path().join("my-project");
     std::fs::create_dir_all(&project_root)?;
 
     let encoded_project = project_root
         .to_string_lossy()
         .trim_start_matches(['/', '\\'])
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    #[cfg(windows)]
-    let encoded_project = encoded_project.replacen("--", "-", /*count*/ 1);
+        .replace([':', '/', '\\'], "-");
     let session_path = source_home
         .join("projects")
         .join(encoded_project)
@@ -277,7 +478,7 @@ async fn external_agent_config_secondary_source_imports_session_and_plugin_end_t
                 "message": {
                     "content": [{
                         "type": "text",
-                        "text": "<user_query>first request</user_query>"
+                        "text": "<cursor_commands>\n/verify\n</cursor_commands>\n<timestamp>2026-07-26T18:00:00Z</timestamp>\n<user_query>first request</user_query>"
                     }]
                 }
             })
@@ -405,6 +606,7 @@ source = {:?}
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -412,6 +614,8 @@ source = {:?}
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -536,9 +740,11 @@ async fn external_agent_config_import_sends_completion_notification_for_sync_onl
     )
     .await??;
     assert_eq!(completed.import_id, import_id);
-    let state_db =
-        codex_state::StateRuntime::init(sqlite_home.path().to_path_buf(), "mock_provider".into())
-            .await?;
+    let state_db = codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(sqlite_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
     let details_record = state_db
         .external_agent_config_import_details_record(&import_id)
         .await?
@@ -585,6 +791,74 @@ async fn external_agent_config_import_sends_completion_notification_for_sync_onl
         serde_json::to_value(&entry.failures)?,
         serde_json::to_value(&expected_failures)?
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_agent_config_records_externally_completed_import_history() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let sqlite_home = TempDir::new()?;
+    let home_dir = codex_home.path().display().to_string();
+    let sqlite_home_dir = sqlite_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("HOME", Some(home_dir.as_str())),
+            ("CODEX_SQLITE_HOME", Some(sqlite_home_dir.as_str())),
+        ])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import/recordHistory",
+            Some(serde_json::json!({
+                "providerId": "external-provider",
+                "itemTypeResults": [{
+                    "itemType": "SESSIONS",
+                    "successes": [{
+                        "itemType": "SESSIONS",
+                        "cwd": "/repo",
+                        "source": "/source/session.jsonl",
+                        "target": "thread-1",
+                    }],
+                    "failures": [],
+                }],
+            })),
+        )
+        .await?;
+    let record_response: ExternalAgentConfigImportHistoryRecordResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert!(!record_response.import_id.is_empty());
+
+    let request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import/readHistories",
+            /*params*/ None,
+        )
+        .await?;
+    let history_response: ExternalAgentConfigImportHistoriesReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let entry = history_response
+        .data
+        .iter()
+        .find(|entry| entry.import_id == record_response.import_id)
+        .expect("externally completed import history entry should be available");
+    assert_eq!(entry.provider_id.as_deref(), Some("external-provider"));
+    assert!(entry.completed_at_ms > 0);
+    assert_eq!(
+        serde_json::to_value(&entry.successes)?,
+        serde_json::json!([{
+            "itemType": "SESSIONS",
+            "cwd": "/repo",
+            "source": "/source/session.jsonl",
+            "target": "thread-1",
+            "title": null,
+        }])
+    );
+    assert_eq!(entry.failures, Vec::new());
 
     Ok(())
 }
@@ -1184,6 +1458,111 @@ async fn external_agent_config_import_completed_tracks_analytics_event() -> Resu
 }
 
 #[tokio::test]
+async fn external_agent_config_import_reports_session_config_error_subtype() -> Result<()> {
+    let analytics_server = start_analytics_events_server().await?;
+    let codex_home = TempDir::new()?;
+    write_analytics_config(codex_home.path(), &analytics_server.uri())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let project_root = codex_home.path().join("repo");
+    let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
+    let session_path = session_dir.join("session.jsonl");
+    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::create_dir_all(&session_dir)?;
+    std::fs::write(
+        &session_path,
+        serde_json::json!({
+            "type": "user",
+            "cwd": &project_root,
+            "timestamp": &recent_timestamp,
+            "message": { "content": "first request" },
+        })
+        .to_string(),
+    )?;
+
+    let home_dir = codex_home.path().display().to_string();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "chatgpt_base_url = [",
+    )?;
+
+    let request_id = mcp
+        .send_raw_request(
+            "externalAgentConfig/import",
+            Some(serde_json::json!({
+                "source": "test_import",
+                "providerId": "test-provider-42",
+                "migrationItems": [{
+                    "itemType": "SESSIONS",
+                    "description": "Migrate recent sessions",
+                    "cwd": null,
+                    "details": {
+                        "sessions": [{
+                            "path": session_path,
+                            "cwd": project_root,
+                            "title": "first request"
+                        }]
+                    }
+                }]
+            })),
+        )
+        .await?;
+    let response: ExternalAgentConfigImportResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let import_id = assert_import_response(response);
+    let completed: ExternalAgentConfigImportCompletedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_notification("externalAgentConfig/import/completed"),
+    )
+    .await??;
+    assert_eq!(completed.import_id, import_id);
+    assert_eq!(completed.item_type_results.len(), 1);
+    assert_eq!(completed.item_type_results[0].successes.len(), 0);
+    assert_eq!(completed.item_type_results[0].failures.len(), 1);
+    let failure = &completed.item_type_results[0].failures[0];
+    assert_eq!(failure.failure_stage, "session_persist");
+    assert_eq!(
+        failure.sub_error_type.as_deref(),
+        Some("failed_to_load_session_config_invalid_data")
+    );
+
+    let event = wait_for_analytics_event(
+        &analytics_server,
+        DEFAULT_TIMEOUT,
+        "codex_onboarding_external_agent_import_failure",
+    )
+    .await?;
+    let event_params = &event["event_params"];
+    assert_eq!(event_params["import_id"], serde_json::json!(import_id));
+    assert_eq!(event_params["source"], "test_import");
+    assert_eq!(event_params["provider_id"], "test-provider-42");
+    assert_eq!(event_params["type"], "SESSIONS");
+    assert_eq!(event_params["failure_stage"], "session_persist");
+    assert_eq!(
+        event_params["sub_error_type"],
+        "failed_to_load_session_config_invalid_data"
+    );
+    assert!(event_params.get("raw_errors").is_none());
+    assert!(event_params.get("message").is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_agent_config_import_reinstalls_plugins_from_known_marketplaces() -> Result<()> {
     let codex_home = TempDir::new()?;
     let analytics_server = start_analytics_events_server().await?;
@@ -1444,7 +1823,12 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
     let project_root = codex_home.path().join("repo");
-    let recent_timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let source_created_at_text = "2024-01-02T03:04:05Z";
+    let source_updated_at_text = "2024-03-01T04:05:06Z";
+    let source_created_at =
+        chrono::DateTime::parse_from_rfc3339(source_created_at_text)?.timestamp();
+    let source_updated_at =
+        chrono::DateTime::parse_from_rfc3339(source_updated_at_text)?.timestamp();
     let session_dir = external_agent_home(codex_home.path()).join("projects/repo");
     let session_path = session_dir.join("session.jsonl");
     let manifest_dir = connector_metadata_root(codex_home.path())
@@ -1471,22 +1855,22 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             serde_json::json!({
                 "type": "user",
                 "cwd": &project_root,
-                "timestamp": &recent_timestamp,
+                "timestamp": source_created_at_text,
                 "message": { "content": control_request },
             })
             .to_string(),
             serde_json::json!({
                 "type": "user",
                 "cwd": &project_root,
-                "timestamp": &recent_timestamp,
+                "timestamp": "2024-01-03T00:00:00Z",
                 "message": { "content": first_request },
             })
             .to_string(),
             serde_json::json!({
                 "type": "assistant",
                 "cwd": &project_root,
-                "timestamp": &recent_timestamp,
-                "attributionMcpServer": "gmail-server",
+                "timestamp": source_updated_at_text,
+                "attributionMcpServer": "gmail",
                 "message": { "content": "first answer" },
             })
             .to_string(),
@@ -1550,7 +1934,6 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         session_success.item_type,
         ExternalAgentConfigMigrationItemType::Sessions
     );
-    assert_eq!(session_success.cwd, None);
     let session_source = std::fs::canonicalize(&session_path)?.display().to_string();
     assert_eq!(
         session_success.source.as_deref(),
@@ -1578,9 +1961,17 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             source: ExternalAgentImportedConnectorSource::RemoteMcpServersConfig,
         }]
     );
+    let imported_session = response
+        .data
+        .iter()
+        .flat_map(|history| history.successes.iter())
+        .find(|success| success.item_type == ExternalAgentConfigMigrationItemType::Sessions)
+        .expect("imported session history should be available");
+    assert_eq!(imported_session.title.as_deref(), Some("Fix auth flow"));
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -1588,8 +1979,10 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
-            use_state_db_only: false,
+            use_state_db_only: true,
             search_term: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
@@ -1605,6 +1998,9 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     assert_eq!(imported_thread_id, thread.id.to_string());
     assert_eq!(thread.preview, control_request);
     assert_eq!(thread.name.as_deref(), Some("Fix auth flow"));
+    assert_eq!(thread.created_at, source_created_at);
+    assert_eq!(thread.updated_at, source_updated_at);
+    assert_eq!(thread.recency_at, Some(source_updated_at));
 
     let request_id = mcp
         .send_thread_read_request(ThreadReadParams {
@@ -1650,6 +2046,8 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             text: "<EXTERNAL SESSION IMPORTED>".into(),
             phase: None,
             memory_citation: None,
+            delivery: None,
+            questions: None,
         })
     );
 
@@ -1764,6 +2162,7 @@ required = true
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -1771,6 +2170,8 @@ required = true
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -1847,6 +2248,7 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -1854,6 +2256,8 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -1927,6 +2331,7 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -1934,6 +2339,8 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -2053,6 +2460,7 @@ async fn external_agent_config_import_returns_before_background_session_import_f
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2060,6 +2468,8 @@ async fn external_agent_config_import_returns_before_background_session_import_f
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -2167,6 +2577,7 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: None,
             sort_key: None,
@@ -2174,6 +2585,8 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,

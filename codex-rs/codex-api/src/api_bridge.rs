@@ -1,5 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
+use crate::error::parse_flex_unavailable;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -8,23 +9,55 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
+use codex_protocol::protocol::MisalignmentErrorDetails;
 use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
-use std::time::Duration;
-use uuid::Uuid;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
+    let retry_after = match &err {
+        ApiError::Retryable { retry_after, .. }
+        | ApiError::RateLimitExceeded { retry_after, .. }
+        | ApiError::ServerOverloaded { retry_after }
+        | ApiError::Transport(TransportError::Http { retry_after, .. }) => *retry_after,
+        ApiError::Transport(_)
+        | ApiError::Api { .. }
+        | ApiError::Stream(_)
+        | ApiError::ContextWindowExceeded
+        | ApiError::QuotaExceeded
+        | ApiError::UsageNotIncluded
+        | ApiError::FlexUnavailable
+        | ApiError::RateLimit(_)
+        | ApiError::InvalidRequest { .. }
+        | ApiError::InvalidPrompt { .. }
+        | ApiError::CyberPolicy { .. }
+        | ApiError::BioPolicy { .. }
+        | ApiError::MisalignmentPolicyViolation { .. } => None,
+    };
+    let error = map_api_error_details(err);
+    match retry_after {
+        Some(retry_after) => error.with_retry_after(retry_after),
+        None => error,
+    }
+}
+
+fn map_api_error_details(err: ApiError) -> CodexErr {
     match err {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
-        ApiError::Stream(msg) => CodexErr::Stream(msg, None),
-        ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
+        ApiError::Retryable { message, .. } => CodexErr::Stream(message),
+        ApiError::RateLimitExceeded { message, .. } => {
+            CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
+        }
+        ApiError::Stream(msg) => CodexErr::Stream(msg),
+        ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+        ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
             CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -39,42 +72,101 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
-        ApiError::CyberPolicy { message } => CodexErr::CyberPolicy { message },
+        ApiError::InvalidPrompt { message } => {
+            CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
+        }
+        ApiError::CyberPolicy { message } => {
+            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+        }
+        ApiError::BioPolicy { message } => CodexErr::new(CodexErrorDetails::BioPolicy { message }),
+        ApiError::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        } => CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        }),
         ApiError::Transport(transport) => match transport {
             TransportError::Http {
                 status,
                 url,
                 headers,
                 body,
+                ..
             } => {
                 let body_text = body.unwrap_or_default();
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && matches!(
-                        value
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(serde_json::Value::as_str),
-                        Some("server_is_overloaded" | "slow_down")
-                    )
+                    && let Some(error) = value.get("error")
                 {
-                    return CodexErr::ServerOverloaded;
+                    match error.get("code").and_then(Value::as_str) {
+                        Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
+                        Some("slow_down") => {
+                            return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
+                                error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if (status == http::StatusCode::BAD_REQUEST
+                    || status == http::StatusCode::FORBIDDEN)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && error.get("code").and_then(Value::as_str)
+                        == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE.to_string()
+                        });
+                    return CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+                        message,
+                        misalignment: error.get("misalignment").cloned().and_then(|details| {
+                            serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
+                        }),
+                    });
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
                         && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
+                        && let Some(
+                            code @ (CYBER_POLICY_ERROR_CODE
+                            | BIO_POLICY_ERROR_CODE
+                            | INVALID_PROMPT_ERROR_CODE),
+                        ) = error.get("code").and_then(Value::as_str)
                     {
+                        let fallback_message = if code == BIO_POLICY_ERROR_CODE {
+                            BIO_POLICY_FALLBACK_MESSAGE
+                        } else if code == INVALID_PROMPT_ERROR_CODE {
+                            INVALID_PROMPT_FALLBACK_MESSAGE
+                        } else {
+                            CYBER_POLICY_FALLBACK_MESSAGE
+                        };
                         let message = error
                             .get("message")
                             .and_then(Value::as_str)
                             .filter(|message| !message.trim().is_empty())
                             .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::CyberPolicy { message }
+                            .unwrap_or_else(|| fallback_message.to_string());
+                        if code == BIO_POLICY_ERROR_CODE {
+                            CodexErr::new(CodexErrorDetails::BioPolicy { message })
+                        } else if code == INVALID_PROMPT_ERROR_CODE {
+                            CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
+                        } else {
+                            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+                        }
                     } else if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
@@ -85,6 +177,11 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
+                    if let Ok(body) = serde_json::from_str::<Value>(&body_text)
+                        && let Some(error) = body.get("error").and_then(parse_flex_unavailable)
+                    {
+                        return map_api_error(error);
+                    }
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
                             let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
@@ -107,29 +204,32 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                             return CodexErr::UsageLimitReached(UsageLimitReachedError {
                                 plan_type: err.error.plan_type,
                                 resets_at,
+                                limit_window_minutes: err
+                                    .error
+                                    .limit_window_minutes
+                                    .as_ref()
+                                    .and_then(Value::as_u64)
+                                    .and_then(|minutes| u16::try_from(minutes).ok()),
                                 rate_limits: rate_limits.map(Box::new),
                                 promo_message,
                                 rate_limit_reached_type,
                             });
                         } else if err.error.error_type.as_deref() == Some("usage_not_included") {
                             return CodexErr::UsageNotIncluded;
+                        } else if err.error.error_type.as_deref() == Some("insufficient_quota")
+                            || matches!(
+                                err.error.code.as_deref(),
+                                Some(
+                                    "insufficient_quota"
+                                        | "credit_balance_exhausted"
+                                        | "organization_spend_limit_exceeded"
+                                        | "project_spend_limit_exceeded"
+                                        | "organization_usage_limit_exceeded"
+                                )
+                            )
+                        {
+                            return CodexErr::QuotaExceeded;
                         }
-                    }
-
-                    // Instafy's model proxy does not retry an upstream rate limit itself. It
-                    // answers with a 429 whose body is marked retryable and leaves the retry to
-                    // this client. A stream error sends the turn through the stream retry budget
-                    // after the proxy's delay, instead of ending it on a RetryLimit that claims
-                    // retries were made when none were. A stream error carries no status code,
-                    // so the status leads the message: once the budget runs out, whatever reads
-                    // the final error can still tell it was a 429.
-                    if let Some(message) = instafy_retryable_error_message(&body_text) {
-                        let delay = instafy_retryable_429_delay(
-                            headers.as_ref(),
-                            Utc::now(),
-                            retry_jitter_sample(),
-                        );
-                        return CodexErr::Stream(format!("{status}: {message}"), Some(delay));
                     }
 
                     CodexErr::RetryLimit(RetryLimitReachedError {
@@ -157,11 +257,16 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 request_id: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
-            TransportError::Network(msg) | TransportError::Build(msg) => {
-                CodexErr::Stream(msg, None)
+            TransportError::Policy(denied) => CodexErr::Fatal(denied.to_string()),
+            TransportError::Connection(source) => {
+                CodexErr::ConnectionFailed(ConnectionFailedError { source })
+            }
+            TransportError::Network(msg) | TransportError::Build(msg) => CodexErr::Stream(msg),
+            error @ TransportError::ResponseTooLarge { .. } => {
+                CodexErr::InvalidRequest(error.to_string())
             }
         },
-        ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
+        ApiError::RateLimit(msg) => CodexErr::Stream(msg),
     }
 }
 
@@ -171,26 +276,18 @@ const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
 const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
 const X_ERROR_JSON_HEADER: &str = "x-error-json";
+const INVALID_PROMPT_ERROR_CODE: &str = "invalid_prompt";
+const INVALID_PROMPT_FALLBACK_MESSAGE: &str = "Invalid request.";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
+const BIO_POLICY_ERROR_CODE: &str = "bio_policy";
+const BIO_POLICY_FALLBACK_MESSAGE: &str = "This content was flagged for possible biological risk.";
+const MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE: &str = "misalignment_policy_violation";
+const MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE: &str =
+    "This request was blocked due to a misalignment policy violation.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =
     "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
-const RETRY_AFTER_HEADER: &str = "retry-after";
-const INSTAFY_UPSTREAM_ERROR_TYPE: &str = "upstream_error";
-const INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE: &str = "The AI provider is rate limiting requests.";
-// Bounded Instafy proxy runs allow one stream retry per sampling request, and other runs
-// keep the provider's default stream retry count. Either way the count starts over for
-// each sampling request, so a single wait should outlast a short rate-limit window
-// without spending much of a bounded run's time budget. A missing or unreadable
-// Retry-After gets a few seconds rather than the sub-second backoff.
-const INSTAFY_RETRYABLE_429_DEFAULT_DELAY: Duration = Duration::from_secs(5);
-const INSTAFY_RETRYABLE_429_MIN_DELAY: Duration = Duration::from_secs(1);
-const INSTAFY_RETRYABLE_429_MAX_DELAY: Duration = Duration::from_secs(30);
-// Managed runtimes share one upstream key, so turns that hit the same limit get the same
-// Retry-After and would all retry at the same instant. Waiting up to this much longer,
-// never shorter, spreads them out while still honoring the proxy's floor.
-const INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT: u32 = 20;
 
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
@@ -237,108 +334,6 @@ fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Returns the error message when a 429 body has the Instafy proxy shape
-/// `{"error":{"type":"upstream_error","message":...,"retryable":true}}`, and `None`
-/// for any other body, so another provider's retryable 429 keeps its old handling.
-fn instafy_retryable_error_message(body: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(body).ok()?;
-    let error = parsed.get("error")?;
-    if error.get("type").and_then(Value::as_str) != Some(INSTAFY_UPSTREAM_ERROR_TYPE)
-        || error.get("retryable").and_then(Value::as_bool) != Some(true)
-    {
-        return None;
-    }
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map_or_else(
-            || INSTAFY_RETRYABLE_429_FALLBACK_MESSAGE.to_string(),
-            str::to_string,
-        );
-    Some(message)
-}
-
-/// Reads Retry-After as delta-seconds or an HTTP date and clamps it, so a
-/// hostile or mistaken header cannot stall a turn for minutes, then spreads the
-/// retry by up to `INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT` so runtimes sharing
-/// one key do not all retry at the same instant. Below the cap the spread only
-/// lengthens the wait and uses the room left under the cap; when the server asked
-/// for the cap or longer, the wait is already shorter than asked, so the spread
-/// goes below the cap instead of pinning every retry to exactly the cap.
-/// `jitter` is a sample from [0, 1] that picks where in that spread the retry lands;
-/// it is a parameter so tests can pin it (0 means no spread).
-fn instafy_retryable_429_delay(
-    headers: Option<&HeaderMap>,
-    now: DateTime<Utc>,
-    jitter: f64,
-) -> Duration {
-    let asked = extract_header(headers, RETRY_AFTER_HEADER)
-        .and_then(|value| parse_retry_after(value.trim(), now))
-        .unwrap_or(INSTAFY_RETRYABLE_429_DEFAULT_DELAY);
-    let requested = asked.clamp(
-        INSTAFY_RETRYABLE_429_MIN_DELAY,
-        INSTAFY_RETRYABLE_429_MAX_DELAY,
-    );
-    let jitter = jitter.clamp(0.0, 1.0);
-    let max_spread = requested * INSTAFY_RETRYABLE_429_MAX_JITTER_PERCENT / 100;
-    if asked >= INSTAFY_RETRYABLE_429_MAX_DELAY {
-        return INSTAFY_RETRYABLE_429_MAX_DELAY - max_spread.mul_f64(jitter);
-    }
-    let room = max_spread.min(INSTAFY_RETRYABLE_429_MAX_DELAY - requested);
-    requested + room.mul_f64(jitter)
-}
-
-/// A uniform sample from [0, 1] for spreading retries. The leading bytes of a v4
-/// UUID are random, and this crate already makes v4 UUIDs for request ids, so the
-/// spread needs no new dependency.
-fn retry_jitter_sample() -> f64 {
-    let bytes = Uuid::new_v4().into_bytes();
-    let sample = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    f64::from(sample) / f64::from(u32::MAX)
-}
-
-fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
-    if let Some(delay) = parse_retry_after_seconds(value) {
-        return Some(delay);
-    }
-    // HTTP dates use the RFC 1123 form, which RFC 2822 parsing accepts. A date
-    // that has already passed means the caller may retry right away.
-    let retry_at = DateTime::parse_from_rfc2822(value).ok()?;
-    Some(
-        (retry_at.with_timezone(&Utc) - now)
-            .to_std()
-            .unwrap_or(Duration::ZERO),
-    )
-}
-
-/// RFC 9110 delta-seconds is a whole number, but proxies and SDKs also send
-/// fractions and the odd negative value. A fraction rounds up so the retry never
-/// lands inside the window, a negative value means the window has already passed,
-/// and a value too large for a `Duration` saturates. The caller clamps all three.
-/// Anything other than an optional minus sign, digits and one decimal point (for
-/// example `inf`, `1e3` or `+5`) is not delta-seconds and falls through to date
-/// parsing.
-fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
-    let (negative, magnitude) = match value.strip_prefix('-') {
-        Some(magnitude) => (true, magnitude),
-        None => (false, value),
-    };
-    if !magnitude
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return None;
-    }
-    // Rejects an empty string, a lone point and more than one point.
-    let seconds = magnitude.parse::<f64>().ok()?;
-    if negative {
-        return Some(Duration::ZERO);
-    }
-    Some(Duration::try_from_secs_f64(seconds.ceil()).unwrap_or(Duration::MAX))
-}
-
 #[derive(Debug, Deserialize)]
 struct UsageErrorResponse {
     error: UsageErrorBody,
@@ -346,8 +341,10 @@ struct UsageErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct UsageErrorBody {
+    code: Option<String>,
     #[serde(rename = "type")]
     error_type: Option<String>,
     plan_type: Option<PlanType>,
     resets_at: Option<i64>,
+    limit_window_minutes: Option<Value>,
 }
