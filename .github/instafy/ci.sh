@@ -18,33 +18,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # dropped again, and this check fails the sync PR until they are.
 allowed_workflow=".github/workflows/instafy-ci.yml"
 
-# Crates packages/runtime-agent in instafy-dev/instafy depends on by path.
-runtime_agent_crates=(
-  codex-apply-patch
-  codex-arg0
-  codex-config
-  codex-core
-  codex-exec-server
-  codex-extension-api
-  codex-features
-  codex-git-utils
-  codex-login
-  codex-model-provider-info
-  codex-models-manager
-  codex-process-hardening
-  codex-protocol
-  codex-rmcp-client
-  codex-shell-command
-  codex-utils-absolute-path
-  codex-utils-path-uri
-)
+# No separate `cargo check` of the crates runtime-agent path-depends on: the
+# test build below already compiles all of them, and instafy-dev/instafy's
+# build.yml runs `cargo check --locked --tests` on runtime-agent against this
+# submodule with runtime-agent's real feature set.
 
 # The tests that cover Instafy's patches, as "<test binary>|<name filter>|<what
 # it covers>". An empty filter runs every test in that binary. Each entry must
 # match at least one passing test, so a renamed test or module fails the job
 # instead of passing silently.
 patch_tests=(
-  "codex_api||99f24c873 retryable proxy 429 mapping; SSE incomplete handling (#3, #4)"
+  "codex_api||99f24c873 retryable proxy 429 mapping"
   "codex_models_manager||f3104759e GPT-6 Luna in the bundled models.json"
   "codex_exec_server|reqwest_http_client::tests::|11be4c61f e834d276e loopback HTTP client"
   "codex_rmcp_client|stdio_server_launcher::tests::|11be4c61f e834d276e stdio launcher"
@@ -52,9 +36,15 @@ patch_tests=(
   "codex_mcp|runtime::tests::|11be4c61f MCP runtime generations"
   "codex_core|client::tests::|3745197c1 bounded execution before a final response"
   "codex_core|session::tests::|11be4c61f turn abort and shutdown ordering"
+  "codex_mcp|connection_manager::tests::|11be4c61f MCP connection manager"
+  "codex_mcp|rmcp_client::tests::|11be4c61f MCP rmcp client"
+  "codex_rmcp_client|rmcp_client::tests::|11be4c61f rmcp client"
+  "codex_core|tasks::tests::|11be4c61f task lifecycle"
+  "codex_core|session::mcp::tests::|11be4c61f session MCP lifecycle"
+  "codex_core|session::turn::tests::|11be4c61f turn lifecycle"
   "all|retryable_proxy_rate_limit::|99f24c873 retryable proxy 429 end to end"
   "all|responses_lite::|3745197c1 responses-lite required tool choice"
-  "all|incomplete|incomplete responses end to end (#3, #4)"
+  "all|incomplete|upstream incomplete-response coverage; narrow to incomplete_response_not_retried:: once #3 lands"
 )
 
 # One package set and one target selection for the whole test build and run.
@@ -116,15 +106,6 @@ rust() {
   export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
   export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
   export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
-
-  local check_args=() crate
-  for crate in "${runtime_agent_crates[@]}"; do
-    check_args+=(-p "$crate")
-  done
-
-  group "cargo check: crates runtime-agent path-depends on"
-  cargo check --locked "${check_args[@]}"
-  endgroup
 
   group "cargo test --no-run: build the patch test binaries"
   cargo test --locked "${test_packages[@]}" "${test_targets[@]}" --no-run

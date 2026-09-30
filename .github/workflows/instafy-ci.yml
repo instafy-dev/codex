@@ -6,9 +6,9 @@
 name: instafy-ci
 
 on:
+  # Every PR whose merge commit carries this file, stacked PRs included; the
+  # jobs still run only on standard ubuntu-24.04 runners.
   pull_request:
-    branches:
-      - "instafy/**"
   push:
     branches:
       - instafy/integration
@@ -77,7 +77,7 @@ jobs:
           fi
 
   rust:
-    name: Rust (Instafy patches, runtime-agent crates)
+    name: Rust (Instafy patch tests)
     needs: workflow-allowlist
     if: needs.workflow-allowlist.outputs.rust == 'true'
     runs-on: ubuntu-24.04
@@ -124,7 +124,7 @@ jobs:
           key: instafy-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml', '.github/instafy/ci.sh', '.github/workflows/instafy-ci.yml') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('instafy-rust-v1-{0}-{1}-', runner.os, runner.arch) || '' }}
 
-      - name: Check runtime-agent crates and run the Instafy patch tests
+      - name: Build and run the Instafy patch tests
         run: bash .github/instafy/ci.sh rust
 
       - name: Save Rust cache

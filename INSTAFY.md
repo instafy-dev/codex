@@ -5,28 +5,31 @@
 `packages/runtime-agent` there depends on the `codex-rs` crates by path, and the runtime
 image compiles them for Linux. Nothing is built, signed or released from this fork.
 
-- `main` mirrors upstream.
+- `main` is the default branch and still carries upstream's files. Never sync it with the
+  GitHub "Sync fork" button, and never push upstream tags (`rust-v*`, `rusty-v8-v*`,
+  `codex-zsh-v*`, `python-v*`) here: a push runs the workflows in the pushed commit, so
+  either would start upstream's paid macOS release builds.
 - Instafy work lands on `instafy/integration` through pull requests. Instafy's own commits
   use the `fix(instafy)` / `feat(instafy)` prefix.
 
 ## CI
 
 The only workflow is [`.github/workflows/instafy-ci.yml`](.github/workflows/instafy-ci.yml).
-It runs on pull requests into `instafy/**`, on pushes to `instafy/integration` and on manual
-dispatch, on standard `ubuntu-24.04` runners only. It never uses larger runners, macOS or
+It runs on every pull request whose merge commit carries it (stacked PRs included), on pushes
+to `instafy/integration` and on manual dispatch, on standard `ubuntu-24.04` runners only. It never uses larger runners, macOS or
 Windows.
 
 - **workflow-allowlist** fails if `.github/workflows` contains anything besides
   `instafy-ci.yml`, or if `.github/dependabot.yml`/`.yaml` exists.
-- **rust** runs `cargo check` on the crates runtime-agent path-depends on, then only the
-  tests that cover Instafy's patches, listed per test binary in
+- **rust** builds and runs only the tests that cover Instafy's patches, listed per test binary in
   [`.github/instafy/ci.sh`](.github/instafy/ci.sh). An entry that matches no passing test
   fails the job instead of passing silently. The job is skipped when nothing under
   `codex-rs/`, `.github/instafy/` or the workflow changed.
 
 There is no clippy matrix, nextest platform matrix, Bazel, release build or macOS/Windows
 coverage here. `instafy-dev/instafy`'s CI builds and tests runtime-agent against the pinned
-submodule, which is the check that matters for Instafy.
+submodule (including `cargo check --tests` on runtime-agent), which is the check that
+matters for Instafy.
 
 ## Syncing upstream
 
@@ -44,10 +47,14 @@ If a sync renames a module or test that `ci.sh` filters on, the rust job names t
 that matched nothing; update it in `ci.sh`. When a new Instafy patch lands, add its tests
 there too.
 
-The allowlist only guards the `instafy/**` branches. GitHub takes a push's workflows from the
-pushed branch, a `pull_request_target` run's from the base branch, and scheduled and issue
-runs from the default branch. `main` is the default branch and still mirrors upstream's
-workflows, so those must stay disabled in the repository's Actions settings.
+The allowlist only guards branches that carry this file. GitHub takes a `pull_request` run's
+workflows from the PR's merge commit, a push's or tag push's from the pushed commit, a
+`pull_request_target` run's from the base branch, and scheduled and issue runs from the
+default branch. Upstream workflows that have already run in this repository
+(`blocking-ci.yml`, `v8-canary.yml`, `cla.yml`) are disabled in the Actions settings, which
+covers any later re-add under the same path. A workflow that has never run here cannot be
+disabled in advance, so if an upstream workflow ever starts a run, disable it at once
+(`gh workflow disable <file> -R instafy-dev/codex`).
 
 ## Running the checks locally
 
