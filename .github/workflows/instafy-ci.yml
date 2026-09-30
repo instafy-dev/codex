@@ -1,0 +1,139 @@
+# The only workflow this fork runs. Instafy consumes the fork as the `codex`
+# submodule of instafy-dev/instafy, whose CI builds and tests runtime-agent
+# against it, so this checks only what Instafy relies on. See INSTAFY.md.
+#
+# Standard ubuntu-24.04 runners only: never larger runners, macOS or Windows.
+name: instafy-ci
+
+on:
+  pull_request:
+    branches:
+      - "instafy/**"
+  push:
+    branches:
+      - instafy/integration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflow-allowlist:
+    name: Workflow allowlist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # A pull_request checkout is the merge commit; depth 2 keeps its
+          # first parent, the base branch, for the change detection below.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Only instafy-ci.yml, no Dependabot config
+        run: bash .github/instafy/ci.sh workflow-allowlist
+
+      - name: Detect Rust-relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          run_rust() {
+            echo "rust=true: $1"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$(git rev-parse HEAD^1)"
+              ;;
+            push)
+              base="$PUSH_BEFORE"
+              if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+                run_rust "new branch, nothing to diff against"
+              fi
+              git fetch --no-tags --depth=1 origin "$base" || run_rust "could not fetch $base"
+              ;;
+            *)
+              run_rust "$EVENT_NAME always runs the Rust checks"
+              ;;
+          esac
+          changed="$(git diff --name-only "$base" HEAD)"
+          printf 'Changed files:\n%s\n' "$changed"
+          if grep -Eq '^(codex-rs/|\.github/instafy/|\.github/workflows/instafy-ci\.yml$)' <<<"$changed"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Rust-relevant changes; skipping the Rust job."
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  rust:
+    name: Rust (Instafy patches, runtime-agent crates)
+    needs: workflow-allowlist
+    if: needs.workflow-allowlist.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Build settings (CARGO_INCREMENTAL=0, no debuginfo, RUST_MIN_STACK)
+      # live in ci.sh so a local run matches CI.
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The build needs roughly 10 GiB (a 6 GiB target dir plus the registry
+      # and cache archive). Only clear preinstalled SDKs when space is short.
+      - name: Make room for the build
+        run: |
+          set -euo pipefail
+          df -h /
+          free_gib="$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')"
+          if (( free_gib < 20 )); then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      # Installs 1.95.0, the channel in codex-rs/rust-toolchain.toml. If a sync
+      # moves that file to a newer channel, rustup installs it on first use.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      # Pull requests restore the newest cache of their base branch. Pushes
+      # restore only an exact key, so a new key is always saved from a clean
+      # build and stale artifacts do not accumulate across syncs.
+      - name: Restore Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            codex-rs/target/
+          key: instafy-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml', '.github/instafy/ci.sh', '.github/workflows/instafy-ci.yml') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('instafy-rust-v1-{0}-{1}-', runner.os, runner.arch) || '' }}
+
+      - name: Check runtime-agent crates and run the Instafy patch tests
+        run: bash .github/instafy/ci.sh rust
+
+      - name: Save Rust cache
+        if: success() && github.event_name == 'push' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            codex-rs/target/
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
