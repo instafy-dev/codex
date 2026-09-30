@@ -167,7 +167,20 @@ run_test_binary() {
     echo "$name has no Instafy patch tests; not running it"
     return 0
   fi
-  exec "$exe" "$@" "${filters[@]}"
+  # One process per filter. Some upstream tests depend on process-global state
+  # (tracing's callsite interest cache, for one) and upstream runs every test
+  # in its own process with nextest; sharing one process across filter groups
+  # makes e.g. session::turn::tests::post_sampling_token_estimate_is_disabled_by_always_on_sinks
+  # fail whenever session::tests:: ran first.
+  local rc=0
+  for filter in "${filters[@]}"; do
+    if [[ -z "$filter" ]]; then
+      "$exe" "$@" || rc=$?
+    else
+      "$exe" "$@" "$filter" || rc=$?
+    fi
+  done
+  return "$rc"
 }
 
 usage() {
