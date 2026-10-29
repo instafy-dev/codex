@@ -57,6 +57,7 @@ pub(super) async fn completed_history_app(
         let turn_id = format!("turn-{index}");
         let finished = completed_at.timestamp() + index as i64 * 60;
         let mut events = vec![EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: turn_id.clone(),
             root_turn_id: None,
             trace_id: None,
@@ -94,6 +95,7 @@ pub(super) async fn completed_history_app(
             })
         }));
         events.push(EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id,
             last_agent_message: Some(format!("{name} answer")),
             error: None,
@@ -209,7 +211,7 @@ async fn beginning_navigation_holds_the_view_until_the_last_page_arrives() -> Re
         app.transcript_cells = crate::thread_transcript::thread_items_to_transcript_cells(
             Some(thread_id),
             &app.config.cwd,
-            started.turns.iter().flat_map(|turn| turn.items.clone()),
+            started.turns.iter().flat_map(Turn::item_payloads).cloned(),
             crate::thread_transcript::RawReasoningVisibility::Hidden,
             Some(&app.config),
         );
@@ -329,7 +331,7 @@ async fn returning_to_latest_retains_pending_pages_without_continuing_to_the_beg
     app.transcript_cells = crate::thread_transcript::thread_items_to_transcript_cells(
         Some(thread_id),
         &app.config.cwd,
-        started.turns.iter().flat_map(|turn| turn.items.clone()),
+        started.turns.iter().flat_map(Turn::item_payloads).cloned(),
         crate::thread_transcript::RawReasoningVisibility::Hidden,
         Some(&app.config),
     );

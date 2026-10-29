@@ -27,6 +27,10 @@ use crate::types::canonical_history_mode_from_rollout_items;
 
 const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+#[path = "thread_metadata_sync_preview_tests.rs"]
+mod preview_tests;
+
 /// Live-thread helper that derives metadata updates from appended rollout items.
 ///
 /// Stores receive raw rollout items plus explicit metadata patches. This helper
@@ -302,6 +306,12 @@ impl ThreadMetadataSync {
                             &user.as_legacy_user_message_event(),
                             &mut update,
                         );
+                    } else if let TurnItem::FunctionCallOutput(output) = &event.item
+                        && !self.preview_seen
+                        && let Some(preview) = codex_state::delegated_output_preview(output)
+                    {
+                        self.preview_seen = true;
+                        update.preview = Some(preview);
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::TokenCount(token_count)) => {
@@ -328,7 +338,8 @@ impl ThreadMetadataSync {
                     update.approval_mode = Some(settings.approval_policy);
                     update.permission_profile = Some(settings.permission_profile.clone());
                 }
-                RolloutItem::SessionMeta(_)
+                RolloutItem::DynamicToolsUpdated { .. }
+                | RolloutItem::SessionMeta(_)
                 | RolloutItem::EventMsg(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
@@ -475,6 +486,7 @@ mod tests {
     async fn create_metadata_records_originator_without_project() {
         let thread_id = ThreadId::new();
         let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
+            attached_thread: false,
             creator_user_id: None,
             creator_account_id: None,
             session_id: thread_id.into(),
@@ -553,7 +565,7 @@ mod tests {
         let mut sync = resume_sync(
             thread_id,
             vec![
-                RolloutItem::SessionMeta(session_meta(thread_id)),
+                RolloutItem::SessionMeta(Box::new(session_meta(thread_id))),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
         );
@@ -662,7 +674,7 @@ mod tests {
     fn metadata_irrelevant_items_coalesce_updated_at_touches() {
         let thread_id = ThreadId::new();
         let mut sync = resume_sync(thread_id, Vec::new());
-        let item = RolloutItem::Compacted(CompactedItem {
+        let item = RolloutItem::Compacted(Box::new(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
             retained_context: None,
@@ -675,7 +687,7 @@ mod tests {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        });
+        }));
 
         let first = sync
             .observe_appended_items(std::slice::from_ref(&item))
@@ -702,6 +714,7 @@ mod tests {
         let update = sync
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: "turn-1".to_string(),
                     root_turn_id: None,
                     trace_id: None,
@@ -793,7 +806,7 @@ mod tests {
         let mut sync = resume_sync(
             thread_id,
             vec![
-                RolloutItem::SessionMeta(session_meta(thread_id)),
+                RolloutItem::SessionMeta(Box::new(session_meta(thread_id))),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
         );
@@ -825,7 +838,7 @@ mod tests {
         let sync = resume_sync(
             thread_id,
             vec![
-                RolloutItem::SessionMeta(meta),
+                RolloutItem::SessionMeta(Box::new(meta)),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
         );
@@ -872,6 +885,7 @@ mod tests {
 
     fn resume_params(thread_id: ThreadId, history: Vec<RolloutItem>) -> ResumeThreadParams {
         ResumeThreadParams {
+            history_revision: None,
             thread_id,
             rollout_path: None,
             history: Some(Arc::new(history)),

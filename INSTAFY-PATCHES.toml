@@ -12,11 +12,11 @@
 schema = 1
 
 # The upstream stable tag this branch is built from, and the commit that tag peels to.
-base_tag = "rust-v0.159.2"
-base_commit = "ff6aec96948b70d94983af2641a6b67c94faeff5"
+base_tag = "rust-v0.166.0"
+base_commit = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
 
 # The codex commit instafy-dev/instafy pinned before this base.
-previous_pin = "99f24c873e6e59a1de828699e6d3073927e170e1"
+previous_pin = "ff0a46c73304a503073125cdd6215c2dd215f162"
 
 # The codex-rs crates instafy-dev/instafy builds directly: packages/runtime-agent's path
 # dependencies plus the helper binaries its runtime image and Desktop app ship.
@@ -47,6 +47,7 @@ closure_roots = [
 closure_dirs = [
   "codex-rs/agent-graph-store",
   "codex-rs/agent-identity",
+  "codex-rs/agent-message-board-client",
   "codex-rs/agent-roles",
   "codex-rs/analytics",
   "codex-rs/app-server-protocol",
@@ -73,6 +74,7 @@ closure_dirs = [
   "codex-rs/core-plugin-common",
   "codex-rs/core-plugins",
   "codex-rs/diagnostics",
+  "codex-rs/direct-tool-timing",
   "codex-rs/exec-server",
   "codex-rs/exec-server-protocol",
   "codex-rs/execpolicy",
@@ -96,6 +98,7 @@ closure_dirs = [
   "codex-rs/linux-sandbox",
   "codex-rs/login",
   "codex-rs/memories/read",
+  "codex-rs/message-board",
   "codex-rs/model-provider",
   "codex-rs/model-provider-info",
   "codex-rs/models-manager",
@@ -104,6 +107,7 @@ closure_dirs = [
   "codex-rs/otel",
   "codex-rs/otel-trace-websocket",
   "codex-rs/plugin",
+  "codex-rs/plugin-host",
   "codex-rs/process-hardening",
   "codex-rs/prompts",
   "codex-rs/protocol",
@@ -111,10 +115,10 @@ closure_dirs = [
   "codex-rs/rmcp-client",
   "codex-rs/rollout",
   "codex-rs/rollout-trace",
+  "codex-rs/runtime-agent-instance",
   "codex-rs/sandboxing",
   "codex-rs/secrets",
   "codex-rs/shell-command",
-  "codex-rs/shell-escalation",
   "codex-rs/skills",
   "codex-rs/state",
   "codex-rs/terminal-detection",
@@ -124,7 +128,9 @@ closure_dirs = [
   "codex-rs/utils/absolute-path",
   "codex-rs/utils/audio",
   "codex-rs/utils/cache",
+  "codex-rs/utils/critical-path",
   "codex-rs/utils/git-discovery",
+  "codex-rs/utils/head-tail-buffer",
   "codex-rs/utils/home-dir",
   "codex-rs/utils/image",
   "codex-rs/utils/output-truncation",
